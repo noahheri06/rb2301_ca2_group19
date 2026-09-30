@@ -120,6 +120,10 @@ class WaypointNode(Node):
         self.path = [] # Set this to your planned route (a list of grid-index tuples, in travel order) once you've computed it -- it'll automatically show up in the terminal map print
         self._last_printed_path = None
 
+        self.done = False
+        goal_cell = world_to_grid(*self.goal_list[0], self.origin, self.resolution)
+        self.graph, self.heuristic = create_grid_graph_and_heuristics(self.map_array, goal_cell)
+
     def print_map(self):
         '''Prints the occupancy grid to the terminal: walls, your current position ('S'), all goal points ('W'/'G'),
         and your planned route (self.path) if you've set one ('*'). Safe to call anytime pose is known; does nothing
@@ -171,10 +175,41 @@ class WaypointNode(Node):
         self.waypoints = waypoints
         self.current_waypoint_idx = 0
 
+    def path_planning(self, problem, f):
+        node = Node(problem.initial)
+        frontier = [node]
+        reached = {node.state: node.path_cost}
+
+        while frontier:
+            node = frontier.pop(0)
+
+            if problem.is_goal(node.state):
+                return (get_solution(node))#a list of points
+
+            children = expand(problem, node)
+            for child in children:
+                if child.state not in reached or child.path_cost < reached[child.state]:
+                    reached[child.state] = child.path_cost
+                    frontier = [n for n in frontier if n.state != child.state]
+                    frontier = [n for n in frontier if f(n) <= f(child)] + [child] + [n for n in frontier if f(n) > f(child)]
+
+
+        return None
+
     def timer_callback(self):
         """Controller loop. Insert path planning and PID control logic here"""
         if self.pose is None:
             return # Does not run if no pose received from Odom or Optitrack
+        if not self.done:
+            start_cell = world_to_grid(self.pose[0], self.pose[1], self.origin, self.resolution)
+            goal_cell = world_to_grid(*self.goal_list[0], self.origin, self.resolution)
+            problem = Problem(self.graph, start_cell, goal_cell)
+            self.path = self.path_planning(
+                problem,
+                f=lambda node: node.path_cost + self.heuristic[node.state],
+            ) or []
+            self.done = True
+            print("done")
         self.get_logger().debug(f"Pose: {self.pose}")
 
         if self.path != self._last_printed_path: # Prints once immediately (map + start + goals), then again each time self.path changes
@@ -182,9 +217,118 @@ class WaypointNode(Node):
             self._last_printed_path = list(self.path)
 
         ###### INSERT CODE HERE ######
-        self.move_2D(0.5)
+        
         ###### INSERT CODE HERE ######
 
+def create_grid_graph_and_heuristics(grid, target):
+    rows, cols = grid.shape
+    target_r, target_c = target
+    
+    graph = {}
+    heuristics = {}
+
+    def is_wall(r, c):
+        # Treat out-of-bounds areas as walls
+        if r < 0 or r >= rows or c < 0 or c >= cols:
+            return True
+        return grid[r, c] == 99
+
+    def get_node_cost(r, c):
+        if grid[r, c] == 99:
+            return 10000
+
+        direct_neighbors = [(r-1, c), (r+1, c), (r, c-1), (r, c+1)]
+        corner_neighbors = [(r-1, c-1), (r-1, c+1), (r+1, c-1), (r+1, c+1)]
+
+        if any(is_wall(nr, nc) for nr, nc in direct_neighbors):
+            return 4
+
+        if any(is_wall(nr, nc) for nr, nc in corner_neighbors):
+            return 3
+
+        return 2
+
+    # Movement directions (Up, Down, Left, Right)
+    movement_directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+
+    for r in range(rows):
+        for c in range(cols):
+            current_node = (r, c)
+            graph[current_node] = []
+            
+            # 1. Calculate the heuristic (Manhattan distance to target)
+            # We use absolute differences so the distance doesn't become negative
+            heuristics[current_node] = abs(r - target_r) + abs(c - target_c)
+
+            # 2. Build the graph edges
+            for dr, dc in movement_directions:
+                nr, nc = r + dr, c + dc
+                
+                if 0 <= nr < rows and 0 <= nc < cols:
+                    target_cost = get_node_cost(nr, nc)
+                    graph[current_node].append(((nr, nc), target_cost))
+
+    return graph, heuristics
+
+class Problem:
+
+    def __init__(self, graph, initial, goal):
+        self.graph = graph
+        self.initial = initial
+        self.goal = goal
+
+    def actions(self, state):
+        return [next_state for next_state, local_cost in self.graph[state]]
+
+    def result(self, state, action):
+        return action
+
+    def action_cost(self, state, action, next_state):
+        for neighbor, local_cost in self.graph[state]:
+            if neighbor == next_state:
+                return local_cost
+
+    def is_goal(self, state):
+        return state == self.goal
+
+class Node:
+
+    def __init__(self, state, parent=None, action=None, path_cost=0, depth=0):
+        self.state = state
+        self.parent = parent
+        self.action = action
+        self.path_cost = path_cost
+        self.depth = depth
+        
+
+def expand(problem, node):
+    children = []
+
+    for action in problem.actions(node.state):
+        next_state = problem.result(node.state, action)
+        local_cost = problem.action_cost(node.state, action, next_state)
+
+        child = Node(
+            state=next_state,
+            parent=node,
+            action=action,
+            path_cost=node.path_cost + local_cost,
+            depth=node.depth+1
+        )
+        children.append(child)
+
+    return children
+
+def get_solution(goal_node):
+    path = []
+    node = goal_node
+
+    while node is not None:
+        path.append(node.state)
+        node = node.parent
+
+    path.reverse()
+    return path
 
 class Grid():
     '''
