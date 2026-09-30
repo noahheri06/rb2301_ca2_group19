@@ -112,14 +112,14 @@ class WaypointNode(Node):
         self.timer = self.create_timer(0.05, self.timer_callback)  # Runs at 20Hz. Can be changed.
 
         self.goal_list = goal_list
+        if not self.goal_list:
+            raise ValueError("At least one goal is required")
         self.map_array = map_array
         self.origin = origin # World (x, y) coordinate of the grid's [0, 0] corner. Use with grid_to_world()/world_to_grid()
         self.resolution = resolution # Metres per grid cell for this run (0.2 sim, 0.1 real -- real maze is half scale). Use with grid_to_world()/world_to_grid()
 
         self.pose = None
         self.path = [] # Set this to your planned route (a list of grid-index tuples, in travel order) once you've computed it -- it'll automatically show up in the terminal map print
-        self._last_printed_path = None
-
         self.done = False
         goal_cell = world_to_grid(*self.goal_list[0], self.origin, self.resolution)
         self.graph, self.heuristic = create_grid_graph_and_heuristics(self.map_array, goal_cell)
@@ -134,7 +134,11 @@ class WaypointNode(Node):
         clip = lambda cell: (int(np.clip(cell[0], 0, shape[0]-1)), int(np.clip(cell[1], 0, shape[1]-1)))
         current_cell = clip(world_to_grid(self.pose[0], self.pose[1], self.origin, self.resolution))
         goal_cells = [clip(world_to_grid(gx, gy, self.origin, self.resolution)) for gx, gy in self.goal_list]
-        grid = Grid(self.map_array, starting_position=current_cell, goal_position=goal_cells[-1])
+        grid = Grid(
+            self.map_array,
+            starting_position=current_cell,
+            goal_position=goal_cells[-1],
+        )
         grid.print_grid_map(waypoints=goal_cells, path=self.path)
 
     def yaw_from_quaternion(self, q):
@@ -175,6 +179,43 @@ class WaypointNode(Node):
         self.waypoints = waypoints
         self.current_waypoint_idx = 0
 
+    def _plan_all_goals(self):
+        start_cell = world_to_grid(self.pose[0], self.pose[1], self.origin, self.resolution)
+        self.path = []
+
+        for goal_index, goal in enumerate(self.goal_list, start=1):
+            goal_cell = world_to_grid(*goal, self.origin, self.resolution)
+            if start_cell not in self.graph or goal_cell not in self.graph:
+                self.get_logger().error(
+                    f"Start or goal is outside the map: {start_cell} -> {goal_cell}"
+                )
+                self.done = True
+                return False
+
+            self.graph, self.heuristic = create_grid_graph_and_heuristics(
+                self.map_array, goal_cell
+            )
+            problem = Problem(self.graph, start_cell, goal_cell)
+            segment = self.path_planning(
+                problem,
+                f=lambda node: node.path_cost + self.heuristic[node.state],
+            )
+            if not segment:
+                self.get_logger().error(f"No path found to goal {goal_index}: {goal}")
+                self.path = []
+                self.done = True
+                return False
+
+            self.path.extend(segment if not self.path else segment[1:])
+            self.get_logger().info(
+                f"Planned route to goal {goal_index}/{len(self.goal_list)}: {goal}"
+            )
+            start_cell = goal_cell
+
+        self.done = True
+        self.get_logger().info(f"Full route contains {len(self.path)} grid cells")
+        return True
+
     def path_planning(self, problem, f):
         node = Node(problem.initial)
         frontier = [node]
@@ -197,28 +238,11 @@ class WaypointNode(Node):
         return None
 
     def timer_callback(self):
-        """Controller loop. Insert path planning and PID control logic here"""
-        if self.pose is None:
-            return # Does not run if no pose received from Odom or Optitrack
-        if not self.done:
-            start_cell = world_to_grid(self.pose[0], self.pose[1], self.origin, self.resolution)
-            goal_cell = world_to_grid(*self.goal_list[0], self.origin, self.resolution)
-            problem = Problem(self.graph, start_cell, goal_cell)
-            self.path = self.path_planning(
-                problem,
-                f=lambda node: node.path_cost + self.heuristic[node.state],
-            ) or []
-            self.done = True
-            print("done")
-        self.get_logger().debug(f"Pose: {self.pose}")
-
-        if self.path != self._last_printed_path: # Prints once immediately (map + start + goals), then again each time self.path changes
+        """Plan and display a route through the configured goals once pose is available."""
+        if self.pose is None or self.done:
+            return
+        if self._plan_all_goals():
             self.print_map()
-            self._last_printed_path = list(self.path)
-
-        ###### INSERT CODE HERE ######
-        
-        ###### INSERT CODE HERE ######
 
 def create_grid_graph_and_heuristics(grid, target):
     rows, cols = grid.shape
