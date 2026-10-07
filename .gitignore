@@ -1,7 +1,1 @@
-build/
-install/
-log/
-__pycache__/
-*.pyc
 .vscode/
-src/rb2301_ca2/rb2301_ca2/a_star.ipynb
