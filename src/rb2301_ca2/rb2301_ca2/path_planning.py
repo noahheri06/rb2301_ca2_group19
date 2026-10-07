@@ -7,8 +7,9 @@ import time
 import numpy as np
 import heapq
 import rclpy
-from rclpy.node import Node
+from rclpy.node import Node as ROSNode
 from rclpy.logging import set_logger_level, LoggingSeverity
+from rclpy.signals import SignalHandlerOptions
 
 from rclpy.qos import (
     ReliabilityPolicy,
@@ -28,7 +29,7 @@ set_logger_level("waypoint", level=LoggingSeverity.DEBUG) # Configure to either 
 
 occupancy_grid_resolution = 0.2 # Sim (and grid array) resolution, in metres per cell
 irl_resolution = occupancy_grid_resolution / 2 # The real maze is built at half the scale of the Gazebo maze -- same layout, 0.1m cells instead of 0.2m
-max_translate_velocity = 1.4 # Overwritten in main() based on sim vs real-life; 0.3m/s cap for real life, please keep that in place
+max_translate_velocity = 0.4 # Overwritten in main(); retain the lower 0.3m/s cap for real life
 
 _PACKAGE_DIR = os.path.dirname(os.path.realpath(__file__))
 
@@ -65,7 +66,7 @@ sim_config = {
     "origin": (-1.0, -5.0),
     "resolution": occupancy_grid_resolution,
     "goal_list": [(3.5, -3.5), (3.3, 0.3), (2.5, -3.5), (-0.3, -3.7)],
-    "max_translate_velocity": 1.4,
+    "max_translate_velocity": 0.4,
 }
 
 def load_irl_config(maze_index:int) -> dict:
@@ -87,7 +88,46 @@ def load_irl_config(maze_index:int) -> dict:
     }
 
 
-class WaypointNode(Node):
+def wrap_angle(angle):
+    '''Wrap an angle in radians to [-pi, pi), so turns take the shortest direction.'''
+    return (angle + np.pi) % (2 * np.pi) - np.pi
+
+
+class PIDController:
+    '''PID with bounded integral and conditional integration during saturation.'''
+    def __init__(self, kp, ki, kd, integral_limit, angular=False):
+        self.kp, self.ki, self.kd = kp, ki, kd
+        self.integral_limit = integral_limit
+        self.angular = angular
+        self.reset()
+
+    def reset(self):
+        self.integral = 0.0
+        self.previous_error = None
+
+    def update(self, error, dt, output_min, output_max):
+        derivative = 0.0
+        if self.previous_error is not None:
+            change = error - self.previous_error
+            # Crossing +/-180 degrees must not cause a derivative spike.
+            derivative = (wrap_angle(change) if self.angular else change) / dt
+
+        integral = float(np.clip(
+            self.integral + error * dt, -self.integral_limit, self.integral_limit
+        ))
+        output = self.kp * error + self.ki * integral + self.kd * derivative
+        # Integrate only if it will not push further into an output limit.
+        if not ((output > output_max and error > 0) or
+                (output < output_min and error < 0)):
+            self.integral = integral
+        else:
+            output = self.kp * error + self.ki * self.integral + self.kd * derivative
+
+        self.previous_error = error
+        return float(np.clip(output, output_min, output_max))
+
+
+class WaypointNode(ROSNode):
     '''Node to calculate path and move robot towards given goal_coordinates, using pose info from either gazebo odometer or optitrack'''
     def __init__(self, map_array:np.array, goal_list:list, is_simulation:bool=True, origin:tuple=(0.0, 0.0), resolution:float=occupancy_grid_resolution):
         super().__init__('waypoint')
@@ -121,6 +161,23 @@ class WaypointNode(Node):
         self.pose = None
         self.path = [] # Set this to your planned route (a list of grid-index tuples, in travel order) once you've computed it -- it'll automatically show up in the terminal map print
         self.done = False
+        self.path_planned = False
+        self.waypoints = [] # World-coordinate targets, retaining corners and every goal
+        self.current_waypoint_idx = 0
+        self.goal_waypoint_indices = []
+        self.current_goal_idx = 0
+        self.goal_reached = False
+
+        # Tune these gains in Gazebo. Distance PID outputs m/s; heading PID
+        # takes radians and outputs rad/s. No sideways velocity is commanded.
+        self.distance_pid = PIDController(1.0, 0.05, 0.05, integral_limit=0.2)
+        self.heading_pid = PIDController(2.0, 0.02, 0.1, integral_limit=0.4, angular=True)
+        self.max_linear_speed = min(0.4 if is_simulation else 0.3, max_translate_velocity)
+        self.max_turn_speed = min(1.0, max_translate_velocity * 2)
+        self.waypoint_tolerance = min(0.03, self.resolution * 0.15)
+        self.drive_heading_tolerance = np.deg2rad(15.0)
+        self.slowdown_gain = 1.0 # Speed envelope in m/s per metre remaining
+        self.previous_control_time = None
         goal_cell = world_to_grid(*self.goal_list[0], self.origin, self.resolution)
         self.graph, self.heuristic = create_grid_graph_and_heuristics(self.map_array, goal_cell)
 
@@ -178,17 +235,41 @@ class WaypointNode(Node):
         self.goal_reached = False
         self.waypoints = waypoints
         self.current_waypoint_idx = 0
+        self.distance_pid.reset()
+        self.heading_pid.reset()
+
+    def _segment_waypoints(self, segment, goal):
+        '''Merge only collinear grid steps; never skip a corner or an exact goal.'''
+        cells = [segment[0]]
+        for index in range(1, len(segment) - 1):
+            previous, current, following = segment[index-1:index+2]
+            incoming = (current[0] - previous[0], current[1] - previous[1])
+            outgoing = (following[0] - current[0], following[1] - current[1])
+            if incoming != outgoing:
+                cells.append(current)
+        if cells[-1] != segment[-1]:
+            cells.append(segment[-1])
+
+        waypoints = [grid_to_world(*cell, self.origin, self.resolution) for cell in cells]
+        # Goals may be away from the centre of their containing cell.
+        if np.linalg.norm(np.asarray(waypoints[-1]) - goal) > 1e-9:
+            waypoints.append(tuple(goal))
+        return waypoints
 
     def _plan_all_goals(self):
         start_cell = world_to_grid(self.pose[0], self.pose[1], self.origin, self.resolution)
         self.path = []
+        waypoints = []
+        self.goal_waypoint_indices = []
 
         for goal_index, goal in enumerate(self.goal_list, start=1):
             goal_cell = world_to_grid(*goal, self.origin, self.resolution)
-            if start_cell not in self.graph or goal_cell not in self.graph:
+            if (start_cell not in self.graph or goal_cell not in self.graph or
+                    self.map_array[start_cell] == 99 or self.map_array[goal_cell] == 99):
                 self.get_logger().error(
-                    f"Start or goal is outside the map: {start_cell} -> {goal_cell}"
+                    f"Start or goal is blocked or outside the map: {start_cell} -> {goal_cell}"
                 )
+                self.path = []
                 self.done = True
                 return False
 
@@ -200,20 +281,31 @@ class WaypointNode(Node):
                 problem,
                 f=lambda node: node.path_cost + self.heuristic[node.state],
             )
-            if not segment:
-                self.get_logger().error(f"No path found to goal {goal_index}: {goal}")
+            # The existing graph gives walls a high cost, rather than removing
+            # them. Refuse such a route if no collision-free route exists.
+            if not segment or any(self.map_array[cell] == 99 for cell in segment):
+                self.get_logger().error(f"No collision-free path to goal {goal_index}: {goal}")
                 self.path = []
                 self.done = True
                 return False
 
             self.path.extend(segment if not self.path else segment[1:])
+            segment_waypoints = self._segment_waypoints(segment, goal)
+            if waypoints and np.linalg.norm(
+                    np.asarray(waypoints[-1]) - segment_waypoints[0]) < 1e-9:
+                segment_waypoints = segment_waypoints[1:]
+            waypoints.extend(segment_waypoints)
+            self.goal_waypoint_indices.append(len(waypoints) - 1)
             self.get_logger().info(
                 f"Planned route to goal {goal_index}/{len(self.goal_list)}: {goal}"
             )
             start_cell = goal_cell
 
-        self.done = True
-        self.get_logger().info(f"Full route contains {len(self.path)} grid cells")
+        self.set_waypoints(waypoints)
+        self.path_planned = True
+        self.get_logger().info(
+            f"Full route contains {len(self.path)} grid cells and {len(waypoints)} waypoints"
+        )
         return True
 
     def path_planning(self, problem, f):
@@ -238,11 +330,71 @@ class WaypointNode(Node):
         return None
 
     def timer_callback(self):
-        """Plan and display a route through the configured goals once pose is available."""
+        """Plan once, then follow world-coordinate waypoints with distance/heading PID."""
         if self.pose is None or self.done:
+            self.move_2D()
             return
-        if self._plan_all_goals():
+
+        ###### INSERT CODE HERE ######
+        if not self.path_planned:
+            if not self._plan_all_goals():
+                self.move_2D()
+                return
             self.print_map()
+
+        now = self.get_clock().now().nanoseconds * 1e-9
+        dt = 0.05 if self.previous_control_time is None else now - self.previous_control_time
+        self.previous_control_time = now
+        if dt <= 0.0 or dt > 0.25:
+            self.distance_pid.reset()
+            self.heading_pid.reset()
+            self.move_2D()
+            return
+
+        x, y, heading_degrees = self.pose
+        # Consume reached targets, including coincident goals, in travel order.
+        while self.current_waypoint_idx < len(self.waypoints):
+            target_x, target_y = self.waypoints[self.current_waypoint_idx]
+            distance = float(np.hypot(target_x - x, target_y - y))
+            if distance > self.waypoint_tolerance:
+                break
+            while (self.current_goal_idx < len(self.goal_list) and
+                   self.goal_waypoint_indices[self.current_goal_idx] == self.current_waypoint_idx):
+                self.get_logger().info(
+                    f"Reached goal {self.current_goal_idx + 1}/{len(self.goal_list)}: "
+                    f"{self.goal_list[self.current_goal_idx]}"
+                )
+                self.current_goal_idx += 1
+            self.current_waypoint_idx += 1
+            self.distance_pid.reset()
+            self.heading_pid.reset()
+
+        if self.current_waypoint_idx == len(self.waypoints):
+            self.done = True
+            self.goal_reached = True
+            self.move_2D()
+            self.get_logger().info("All goals reached; stopping")
+            return
+
+        desired_heading = np.arctan2(target_y - y, target_x - x)
+        heading_error = wrap_angle(desired_heading - np.deg2rad(heading_degrees))
+        turn = self.heading_pid.update(
+            heading_error, dt, -self.max_turn_speed, self.max_turn_speed
+        )
+
+        forward_speed = 0.0
+        if abs(heading_error) <= self.drive_heading_tolerance:
+            # The distance envelope tends to zero even with an integral term,
+            # ensuring slowdown at corners and goals rather than overshoot.
+            speed_limit = min(self.max_linear_speed, self.slowdown_gain * distance)
+            forward_speed = self.distance_pid.update(distance, dt, 0.0, speed_limit)
+            forward_speed *= np.cos(heading_error)
+        else:
+            # Rotate in place before moving; do not accumulate distance error.
+            self.distance_pid.reset()
+
+        self.move_2D(x=forward_speed, y=0.0, turn=turn)
+        ###### INSERT CODE HERE ######
 
 def create_grid_graph_and_heuristics(grid, target):
     rows, cols = grid.shape
@@ -522,7 +674,9 @@ def main(args=None):
     is_simulation = cli_args.maze is None # Remember: pass --maze 0 or --maze 1 to ca2.sh when testing on the real lab setup
 
     print("Starting path planning")
-    rclpy.init(args=ros_args)
+    # Let Python handle Ctrl+C so the stop command can be published before
+    # the ROS context is shut down in the finally block below.
+    rclpy.init(args=ros_args, signal_handler_options=SignalHandlerOptions.NO)
 
     if is_simulation:
         config = sim_config
@@ -535,14 +689,17 @@ def main(args=None):
     map_array = np.load(os.path.join(_PACKAGE_DIR, config["map_file"]), allow_pickle=True)
     waypoint = WaypointNode(map_array, config["goal_list"], is_simulation, config["origin"], config["resolution"])
 
-    # Start spinning the waypoint node and only stop once SystemExit error is raised within the node callback
+    # Keep spinning after completion to maintain zero velocity until shutdown.
     try:
         rclpy.spin(waypoint)
-    except SystemExit:
+    except (KeyboardInterrupt, SystemExit):
         print("Shutting down")
-
-    waypoint.destroy_node()
-    rclpy.shutdown()
+    finally:
+        if rclpy.ok():
+            waypoint.move_2D()
+        waypoint.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
