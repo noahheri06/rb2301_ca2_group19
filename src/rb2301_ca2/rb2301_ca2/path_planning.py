@@ -237,11 +237,45 @@ class WaypointNode(Node):
 
         return None
 
+    def find_waypoint(self):
+        if len(self.path) < 2:
+            return self.path[:]
+
+        waypoints = [self.path[0]]
+        previous = self.path[0]
+        previous_direction = None
+
+        for point in self.path[1:]:
+            dx = point[0] - previous[0]
+            dy = point[1] - previous[1]
+
+            if dx == 0 and dy == 0:
+                continue  # Skip duplicate points
+
+            if previous_direction is not None:
+                old_dx, old_dy = previous_direction
+
+                cross = old_dx * dy - old_dy * dx
+                dot = old_dx * dx + old_dy * dy
+
+                if cross != 0 or dot < 0:
+                    waypoints.append(previous)
+
+            previous_direction = (dx, dy)
+            previous = point
+
+        if previous != waypoints[-1]:
+            waypoints.append(previous)
+
+        return waypoints
+
     def timer_callback(self):
         """Plan and display a route through the configured goals once pose is available."""
         if self.pose is None or self.done:
             return
         if self._plan_all_goals():
+            own_waypoints = self.find_waypoint()
+            print(own_waypoints)
             self.print_map()
 
 def create_grid_graph_and_heuristics(grid, target):
