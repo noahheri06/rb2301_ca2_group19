@@ -246,6 +246,12 @@ class WaypointNode(Node):
         previous_direction = None
 
         for point in self.path[1:]:
+            if point in self.goal_list:
+                waypoints.append(point)
+                previous = point
+                previous_direction = None
+                continue
+            
             dx = point[0] - previous[0]
             dy = point[1] - previous[1]
 
