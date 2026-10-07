@@ -222,15 +222,12 @@ class WaypointNode(ROSNode):
         self.current_goal_idx = 0
         self.goal_reached = False
 
-        # Tune these gains in Gazebo. Distance PID outputs m/s; heading PID
-        # takes radians and outputs rad/s. No sideways velocity is commanded.
-        self.distance_pid = PIDController(1.0, 0.05, 0.05, integral_limit=0.2)
-        self.heading_pid = PIDController(2.0, 0.02, 0.1, integral_limit=0.4, angular=True)
+        # Position PID on the robot's forward and sideways axes, in metres.
+        # Integral control can overcome low-speed resistance in Gazebo.
+        self.forward_pid = PIDController(1.0, 0.5, 0.05, integral_limit=0.8)
+        self.sideways_pid = PIDController(1.0, 0.5, 0.05, integral_limit=0.8)
         self.max_linear_speed = min(0.4 if is_simulation else 0.3, max_translate_velocity)
-        self.max_turn_speed = min(1.0, max_translate_velocity * 2)
         self.waypoint_tolerance = min(0.03, self.resolution * 0.15)
-        self.drive_heading_tolerance = np.deg2rad(15.0)
-        self.slowdown_gain = 1.0 # Speed envelope in m/s per metre remaining
         self.previous_control_time = None
         goal_cell = world_to_grid(*self.goal_list[0], self.origin, self.resolution)
         self.graph, self.heuristic = create_grid_graph_and_heuristics(self.map_array, goal_cell)
@@ -311,8 +308,8 @@ class WaypointNode(ROSNode):
         self.goal_reached = False
         self.waypoints = waypoints
         self.current_waypoint_idx = 0
-        self.distance_pid.reset()
-        self.heading_pid.reset()
+        self.forward_pid.reset()
+        self.sideways_pid.reset()
 
     def _segment_waypoints(self, segment, goal):
         '''Merge only collinear grid steps; never skip a corner or an exact goal.'''
@@ -406,7 +403,7 @@ class WaypointNode(ROSNode):
         return None
 
     def timer_callback(self):
-        """Plan once, then follow world-coordinate waypoints with distance/heading PID."""
+        """Follow waypoints with forward/backward and strafe PID; never rotate."""
         if self.pose is None:
             return # Does not run until a pose arrives from Odom or Optitrack
 
@@ -438,8 +435,8 @@ class WaypointNode(ROSNode):
         dt = 0.05 if self.previous_control_time is None else now - self.previous_control_time
         self.previous_control_time = now
         if dt <= 0.0 or dt > 0.25:
-            self.distance_pid.reset()
-            self.heading_pid.reset()
+            self.forward_pid.reset()
+            self.sideways_pid.reset()
             self.move_2D()
             return
 
@@ -458,8 +455,8 @@ class WaypointNode(ROSNode):
                 )
                 self.current_goal_idx += 1
             self.current_waypoint_idx += 1
-            self.distance_pid.reset()
-            self.heading_pid.reset()
+            self.forward_pid.reset()
+            self.sideways_pid.reset()
 
         if self.current_waypoint_idx == len(self.waypoints):
             self.done = True
@@ -468,24 +465,36 @@ class WaypointNode(ROSNode):
             self.get_logger().info("All goals reached; stopping")
             return
 
-        desired_heading = np.arctan2(target_y - y, target_x - x)
-        heading_error = wrap_angle(desired_heading - np.deg2rad(heading_degrees))
-        turn = self.heading_pid.update(
-            heading_error, dt, -self.max_turn_speed, self.max_turn_speed
+        # Waypoints are in world coordinates; move_2D expects robot-frame
+        # velocities. Rotate the position error into the robot's current axes.
+        heading = np.deg2rad(heading_degrees)
+        cos_heading, sin_heading = np.cos(heading), np.sin(heading)
+        dx, dy = target_x - x, target_y - y
+        forward_error = cos_heading * dx + sin_heading * dy
+        sideways_error = -sin_heading * dx + cos_heading * dy
+
+        forward_integral = self.forward_pid.integral
+        sideways_integral = self.sideways_pid.integral
+        forward_speed = self.forward_pid.update(
+            forward_error, dt, -self.max_linear_speed, self.max_linear_speed
         )
+        sideways_speed = self.sideways_pid.update(
+            sideways_error, dt, -self.max_linear_speed, self.max_linear_speed
+         )
 
-        forward_speed = 0.0
-        if abs(heading_error) <= self.drive_heading_tolerance:
-            # The distance envelope tends to zero even with an integral term,
-            # ensuring slowdown at corners and goals rather than overshoot.
-            speed_limit = min(self.max_linear_speed, self.slowdown_gain * distance)
-            forward_speed = self.distance_pid.update(distance, dt, 0.0, speed_limit)
-            forward_speed *= np.cos(heading_error)
-        else:
-            # Rotate in place before moving; do not accumulate distance error.
-            self.distance_pid.reset()
+        # Cap the vector magnitude, so diagonal movement also stays <= 0.4m/s.
+        speed = float(np.hypot(forward_speed, sideways_speed))
+        if speed > self.max_linear_speed:
+            scale = self.max_linear_speed / speed
+            forward_speed *= scale
+            sideways_speed *= scale
+            # Prevent integral windup when the combined speed is saturated.
+            if forward_error * forward_speed > 0:
+                self.forward_pid.integral = forward_integral
+            if sideways_error * sideways_speed > 0:
+                self.sideways_pid.integral = sideways_integral
 
-        self.move_2D(x=forward_speed, y=0.0, turn=turn)
+        self.move_2D(x=forward_speed, y=sideways_speed, turn=0.0)
         ###### INSERT CODE HERE ######
 
 def create_grid_graph_and_heuristics(grid, target):
