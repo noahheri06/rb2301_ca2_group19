@@ -382,6 +382,15 @@ class WaypointNode(ROSNode):
         return True
 
     def path_planning(self, problem, f):
+
+        def direction(node):
+            if node.parent is None:
+                return None
+
+            previous = node.parent.state
+            current = node.state
+            return (current[0] - previous[0],current[1] - previous[1])
+    
         node = Node(problem.initial)
         frontier = [node]
         reached = {node.state: node.path_cost}
@@ -392,8 +401,14 @@ class WaypointNode(ROSNode):
             if problem.is_goal(node.state):
                 return (get_solution(node))#a list of points
 
+            previous_direction = direction(node)
+
             children = expand(problem, node)
             for child in children:
+
+                if previous_direction is not None and previous_direction != direction(child):
+                    child.path_cost += 0.3
+
                 if child.state not in reached or child.path_cost < reached[child.state]:
                     reached[child.state] = child.path_cost
                     frontier = [n for n in frontier if n.state != child.state]
@@ -518,28 +533,36 @@ def create_grid_graph_and_heuristics(grid, target):
         corner_neighbors = [(r-1, c-1), (r-1, c+1), (r+1, c-1), (r+1, c+1)]
 
         if any(is_wall(nr, nc) for nr, nc in direct_neighbors):
-            return 4
-
-        if any(is_wall(nr, nc) for nr, nc in corner_neighbors):
             return 3
 
-        return 2
+        if any(is_wall(nr, nc) for nr, nc in corner_neighbors):
+            return 2
 
-    # Movement directions (Up, Down, Left, Right)
-    movement_directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+        return 1
+
+    # Movement directions
+    movement_directions = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]  # Including diagonal movements 
 
     for r in range(rows):
         for c in range(cols):
             current_node = (r, c)
             graph[current_node] = []
 
-            # Manhattan distance to the target
-            heuristics[current_node] = abs(r - target_r) + abs(c - target_c)
+            # Euclidean distance to the target
+            #heuristics[current_node] = ((r - target_r)**2 + (c - target_c)**2)**0.5
+
+            row_distance = abs(r - target_r)
+            col_distance = abs(c - target_c)
+
+            heuristics[current_node] = max(row_distance, col_distance) + (2**0.5 - 1) * min(row_distance, col_distance)
+            
 
             for dr, dc in movement_directions:
                 nr, nc = r + dr, c + dc
                 if 0 <= nr < rows and 0 <= nc < cols:
                     target_cost = get_node_cost(nr, nc)
+                    if dr != 0 and dc != 0:
+                        target_cost *= 2**0.5
                     graph[current_node].append(((nr, nc), target_cost))
 
     return graph, heuristics
