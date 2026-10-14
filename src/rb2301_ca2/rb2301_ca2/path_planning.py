@@ -646,6 +646,10 @@ def create_grid_graph_and_heuristics(grid, target):
                 if 0 <= nr < rows and 0 <= nc < cols:
                     target_cost = get_node_cost(nr, nc)
                     if dr != 0 and dc != 0:
+                        node1 = grid[r+dr][c]
+                        node2 = grid[r][c+dc]
+                        if node1 == 99 or node2 == 99:
+                            continue
                         target_cost *= 2**0.5
                     graph[current_node].append(((nr, nc), target_cost))
 
