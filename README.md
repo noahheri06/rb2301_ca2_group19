@@ -261,3 +261,61 @@ tools/irl_calibrate.py         for TAs, see below
 Calibration is done once per maze placement, and again if the maze or Optitrack gets moved. Put a robot on two or more known maze points far apart and read the raw pose with `--calibrate`. Then run `python3 tools/irl_calibrate.py --pair 0.5 0.5 <opti_x> <opti_y> --pair 2.7 2.7 <opti_x> <opti_y>`. The residual should be 1 to 2 cm and it warns above 5 cm. Paste `origin_x`, `origin_y` and `rotation_deg` into `[frame]` in `optitrack_variables.config`. Motive has to stream Z-up.
 
 Rigid bodies are created facing maze +y, which is what `heading_offset_deg = auto` assumes. A robot whose rigid body was made differently gets its own line under `[heading_offsets]` as `<robot number> = <reported heading minus true maze heading>` (robots 7 and 12 are measured). The real-robot speed limit is `max_translate_velocity` in `load_irl_config()` in `path_planning.py`.
+
+### Waypoint movement and tuning
+
+The controller always commands zero sideways velocity. At each corner it stops,
+chooses forward or reverse travel according to the smaller heading change, aligns
+on the spot, then drives toward the target. Desired heading is recalculated from
+the current pose on every tick, including while turning. Heading errors above
+12 degrees pause driving for realignment. If the robot passes the target, it can
+reverse rather than making a half turn. Arrival uses the full 2D distance with a
+3 cm tolerance, followed by a 0.15-second pause commanding zero velocity. This
+pause is timed; it does not confirm measured wheel speeds have reached zero.
+
+The original Gazebo URDF, wheel collision meshes, and friction settings are
+unchanged. Small commands on this model can produce little or no motion. The
+simulation controller adds bounded command offsets to compensate for that dead
+zone, using the current pose for feedback. It does not add a velocity PID loop.
+Turning on the spot and turning while driving use separate offsets because the
+model responds differently in these two conditions. Compensation is zero for
+stop commands and adds no sideways velocity.
+
+Tune the settings in `WaypointNode.__init__` in `path_planning.py`:
+
+- `forward_pid`: P=1.0, I=0, D=0 in simulation; P=1.0, I=0.5, D=0.05 on the real robot.
+- `heading_pid`: P=2.0, I=0, D=0; independent of distance control.
+- `linear_compensation`: 0.11 m/s added to simulation forward/backward commands.
+- `align_turn_compensation`: 1.2 rad/s added to simulation on-the-spot turn commands.
+- `drive_turn_compensation`: 0.4 rad/s added to simulation steering commands.
+- `max_angular_speed`: command limit of 2.4 rad/s in simulation and 0.8 rad/s on the real robot. The simulator's achieved rotation rate is lower than its command rate because of the dead zone.
+- `heading_tolerance`: 3 degrees before driving; `realign_threshold`: 12 degrees.
+- `settle_duration`: pause at arrival and after heading alignment.
+
+All compensation offsets are disabled on the real robot. Their simulation values
+are estimates from tests of the supplied model, not universal motor thresholds.
+PID output limits reserve room for compensation, so adding an offset never
+exceeds the command cap. The PID class bounds its integral and prevents further
+integration into saturation. Controllers reset when changing targets or travel
+direction. Translation remains capped at 0.4 m/s overall (the real controller
+currently uses 0.3 m/s). Angular commands never scale with distance to a waypoint.
+
+When debugging movement, the once-per-second `Control:` log reports the movement
+state, target waypoint, exact distance and tolerance, travel direction, and actual
+forward/turn commands published by `move_2D()`. `Waypoint ... reached` logs confirm
+when the controller advances. All application movement goes through `move_2D()`.
+
+Run the isolated headless regression checks from the repository root after
+sourcing your ROS setup:
+
+```bash
+python3 tools/check_waypoint_gazebo.py --timeout 90
+python3 tools/check_waypoint_gazebo.py --full-maze --timeout 480 --realtime-factor 4
+```
+
+The short route exercises the previously missed offset waypoint, backward travel,
+and several turns. The full check plans and visits all four simulation goals.
+Both checks use `move_2D()` through a ROS–Gazebo bridge and assert zero strafing,
+bounded commands, and final position tolerance. They run in ROS domain 219 and a
+unique Gazebo partition. The full check can take several minutes because of the
+original mesh collision model, even with a higher requested real-time factor.

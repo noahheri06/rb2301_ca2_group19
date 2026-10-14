@@ -1,1 +1,8 @@
 __pycache__/
+**build/
+**logs/
+.vscode/
+*.pyc
+*.DS_Store
+***.egg-info/
+**install/

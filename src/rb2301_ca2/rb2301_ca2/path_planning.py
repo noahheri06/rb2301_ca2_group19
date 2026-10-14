@@ -10,7 +10,6 @@ import heapq
 import rclpy
 from rclpy.node import Node as ROSNode
 from rclpy.logging import set_logger_level, LoggingSeverity
-from rclpy.signals import SignalHandlerOptions
 
 from rclpy.qos import (
     ReliabilityPolicy,
@@ -222,12 +221,29 @@ class WaypointNode(ROSNode):
         self.current_goal_idx = 0
         self.goal_reached = False
 
-        # Position PID on the robot's forward and sideways axes, in metres.
-        # Integral control can overcome low-speed resistance in Gazebo.
-        self.forward_pid = PIDController(1.0, 0.5, 0.05, integral_limit=0.8)
-        self.sideways_pid = PIDController(1.0, 0.5, 0.05, integral_limit=0.8)
+        # Independent distance and heading loops. In simulation, compensate the
+        # unchanged mesh-wheel model's command dead zones explicitly, instead
+        # of changing its contact physics or slowly building an integral bias.
+        self.forward_pid = PIDController(
+            1.0, 0.0 if is_simulation else 0.5,
+            0.0 if is_simulation else 0.05, integral_limit=0.8,
+        )
+        self.heading_pid = PIDController(2.0, 0.0, 0.0, integral_limit=2.0, angular=True)
         self.max_linear_speed = min(0.4 if is_simulation else 0.3, max_translate_velocity)
+        self.max_angular_speed = 2.4 if is_simulation else 0.8 # rad/s, independent of translation
+        self.linear_compensation = 0.11 if is_simulation else 0.0 # m/s command offset
+        self.align_turn_compensation = 1.2 if is_simulation else 0.0 # rad/s command offset
+        self.drive_turn_compensation = 0.4 if is_simulation else 0.0 # rad/s command offset
         self.waypoint_tolerance = min(0.03, self.resolution * 0.15)
+        self.heading_tolerance = math.radians(3.0)
+        self.realign_threshold = math.radians(12.0)
+        self.settle_duration = 0.15 # seconds commanding zero before changing segments
+        self.motion_state = "STOP"
+        self.settle_elapsed = 0.0
+        self.aligned_elapsed = 0.0
+        self.segment_start = None
+        self.segment_heading = None
+        self.drive_direction = 1.0
         self.previous_control_time = None
         goal_cell = world_to_grid(*self.goal_list[0], self.origin, self.resolution)
         self.graph, self.heuristic = create_grid_graph_and_heuristics(self.map_array, goal_cell)
@@ -294,22 +310,105 @@ class WaypointNode(ROSNode):
         return self.pose
 
     def move_2D(self, x:float=0.0, y:float=0.0, turn:float=0.0):
-        '''Publishes a Twist message to ROS to move a robot. Inputs are x and y linear velocities, as well as turn (z-axis yaw) angular velocity.'''
+        '''Publishes a Twist message to ROS to move a robot. x is body-forward velocity; y is forced to zero; turn is yaw velocity in rad/s.'''
         twist_msg = Twist()
         x = np.clip(x, -max_translate_velocity, max_translate_velocity)
-        y = np.clip(y, -max_translate_velocity, max_translate_velocity)
-        turn = np.clip(turn, -max_translate_velocity*2, max_translate_velocity*2)
+        y = 0.0 # Never strafe.
+        turn = np.clip(turn, -self.max_angular_speed, self.max_angular_speed)
         twist_msg.linear.x, twist_msg.linear.y, twist_msg.linear.z = float(x), float(y), 0.0
         twist_msg.angular.x, twist_msg.angular.y, twist_msg.angular.z = 0.0, 0.0, float(turn)
         self.publisher_.publish(twist_msg)
+        # Log the actual published command, not just the measured pose.
+        now = time.monotonic()
+        if now - getattr(self, "_last_command_log", 0.0) >= 1.0:
+            self._last_command_log = now
+            target = (self.waypoints[self.current_waypoint_idx]
+                      if self.current_waypoint_idx < len(self.waypoints) else None)
+            distance_log = ""
+            if target is not None and self.pose is not None:
+                distance = math.hypot(target[0] - self.pose[0], target[1] - self.pose[1])
+                distance_log = f"distance={distance:.3f} m (tolerance={self.waypoint_tolerance:.3f}), "
+            self.get_logger().debug(
+                f"Control: state={self.motion_state}, waypoint={self.current_waypoint_idx}, "
+                f"target={target}, {distance_log}direction={self.drive_direction:+.0f}, "
+                f"cmd_vel x={float(x):+.3f} m/s, turn={float(turn):+.3f} rad/s"
+            )
 
     def set_waypoints(self, waypoints:list):
         '''Set new waypoints when a goal has been reached'''
         self.goal_reached = False
         self.waypoints = waypoints
         self.current_waypoint_idx = 0
+        self.motion_state = "STOP"
+        self.settle_elapsed = 0.0
+        self.segment_start = None
         self.forward_pid.reset()
-        self.sideways_pid.reset()
+        self.heading_pid.reset()
+
+    def _begin_segment(self, x, y, heading, target_x, target_y):
+        """Lock forward/reverse choice for this segment."""
+        self.segment_start = (x, y)
+        self.segment_heading = math.atan2(target_y - y, target_x - x)
+        forward_error = wrap_angle(self.segment_heading - heading)
+        reverse_error = wrap_angle(self.segment_heading + math.pi - heading)
+        self.drive_direction = -1.0 if abs(reverse_error) < abs(forward_error) else 1.0
+        self.motion_state = "ALIGN"
+        self.aligned_elapsed = 0.0
+        self.forward_pid.reset()
+        self.heading_pid.reset()
+
+    def _follow_segment(self, x, y, heading, target_x, target_y, dt):
+        if self.segment_start is None:
+            self._begin_segment(x, y, heading, target_x, target_y)
+        dx, dy = target_x - x, target_y - y
+        distance = math.hypot(dx, dy)
+        if distance <= self.waypoint_tolerance:
+            self.move_2D()
+            return
+        # Turning can displace the reported base pose in this Gazebo model.
+        # Aim from the CURRENT pose, including during alignment; a frozen line
+        # and a bounded lateral correction can repeatedly miss a nearby target.
+        desired_heading = math.atan2(dy, dx)
+        if self.drive_direction < 0:
+            desired_heading += math.pi
+        error = wrap_angle(desired_heading - heading)
+        # If the target was passed, reverse rather than performing a half turn.
+        # Direction remains fixed during ordinary driving and alignment.
+        if self.motion_state == "DRIVE" and abs(error) > math.radians(100.0):
+            self.drive_direction *= -1.0
+            error = wrap_angle(error + math.pi)
+            self.forward_pid.reset()
+            self.heading_pid.reset()
+        if self.motion_state == "DRIVE" and abs(error) > self.realign_threshold:
+            self.motion_state = "ALIGN"
+            self.aligned_elapsed = 0.0
+            self.forward_pid.reset()
+            self.heading_pid.reset()
+        if self.motion_state == "ALIGN":
+            if abs(error) <= self.heading_tolerance:
+                self.aligned_elapsed += dt
+                self.move_2D()
+                if self.aligned_elapsed >= self.settle_duration:
+                    self.motion_state = "DRIVE"
+                    self.heading_pid.reset()
+                return
+            self.aligned_elapsed = 0.0
+            turn = self._heading_command(error, dt, self.align_turn_compensation)
+            self.move_2D(turn=turn)
+            return
+        speed = self.forward_pid.update(
+            distance, dt, 0.0, self.max_linear_speed - self.linear_compensation,
+        ) + self.linear_compensation
+        turn = self._heading_command(error, dt, self.drive_turn_compensation)
+        self.move_2D(x=self.drive_direction * speed, turn=turn)
+
+    def _heading_command(self, error, dt, compensation):
+        """Bounded signed dead-zone compensation; zero error still means stop."""
+        if abs(error) < math.radians(0.5):
+            return 0.0
+        limit = self.max_angular_speed - compensation
+        turn = self.heading_pid.update(error, dt, -limit, limit)
+        return turn + math.copysign(compensation, error)
 
     def _segment_waypoints(self, segment, goal):
         '''Merge only collinear grid steps; never skip a corner or an exact goal.'''
@@ -403,7 +502,6 @@ class WaypointNode(ROSNode):
         return None
 
     def timer_callback(self):
-        """Follow waypoints with forward/backward and strafe PID; never rotate."""
         if self.pose is None:
             return # Does not run until a pose arrives from Odom or Optitrack
 
@@ -436,7 +534,10 @@ class WaypointNode(ROSNode):
         self.previous_control_time = now
         if dt <= 0.0 or dt > 0.25:
             self.forward_pid.reset()
-            self.sideways_pid.reset()
+            self.heading_pid.reset()
+            self.motion_state = "STOP"
+            self.settle_elapsed = 0.0
+            self.segment_start = None
             self.move_2D()
             return
 
@@ -447,6 +548,10 @@ class WaypointNode(ROSNode):
             distance = float(np.hypot(target_x - x, target_y - y))
             if distance > self.waypoint_tolerance:
                 break
+            self.get_logger().debug(
+                f"Waypoint {self.current_waypoint_idx} reached: distance={distance:.3f} m; "
+                "advancing to the next target"
+            )
             while (self.current_goal_idx < len(self.goal_list) and
                    self.goal_waypoint_indices[self.current_goal_idx] == self.current_waypoint_idx):
                 self.get_logger().info(
@@ -455,8 +560,11 @@ class WaypointNode(ROSNode):
                 )
                 self.current_goal_idx += 1
             self.current_waypoint_idx += 1
+            self.motion_state = "STOP"
+            self.settle_elapsed = 0.0
+            self.segment_start = None
             self.forward_pid.reset()
-            self.sideways_pid.reset()
+            self.heading_pid.reset()
 
         if self.current_waypoint_idx == len(self.waypoints):
             self.done = True
@@ -465,42 +573,18 @@ class WaypointNode(ROSNode):
             self.get_logger().info("All goals reached; stopping")
             return
 
-        # Waypoints are in world coordinates; move_2D expects robot-frame
-        # velocities. Rotate the position error into the robot's current axes.
-        heading = np.deg2rad(heading_degrees)
-        cos_heading, sin_heading = np.cos(heading), np.sin(heading)
-        dx, dy = target_x - x, target_y - y
-        forward_error = cos_heading * dx + sin_heading * dy
-        sideways_error = -sin_heading * dx + cos_heading * dy
-
-        forward_integral = self.forward_pid.integral
-        sideways_integral = self.sideways_pid.integral
-        forward_speed = self.forward_pid.update(
-            forward_error, dt, -self.max_linear_speed, self.max_linear_speed
-        )
-        sideways_speed = self.sideways_pid.update(
-            sideways_error, dt, -self.max_linear_speed, self.max_linear_speed
-         )
-
-        # Cap the vector magnitude, so diagonal movement also stays <= 0.4m/s.
-        speed = float(np.hypot(forward_speed, sideways_speed))
-        if speed > self.max_linear_speed:
-            scale = self.max_linear_speed / speed
-            forward_speed *= scale
-            sideways_speed *= scale
-            # Prevent integral windup when the combined speed is saturated.
-            if forward_error * forward_speed > 0:
-                self.forward_pid.integral = forward_integral
-            if sideways_error * sideways_speed > 0:
-                self.sideways_pid.integral = sideways_integral
-
-        self.move_2D(x=forward_speed, y=sideways_speed, turn=0.0)
-        ###### INSERT CODE HERE ######
+        if self.motion_state == "STOP":
+            self.move_2D()
+            self.settle_elapsed += dt
+            if self.settle_elapsed >= self.settle_duration:
+                self._begin_segment(x, y, math.radians(heading_degrees), target_x, target_y)
+            return
+        self._follow_segment(x, y, math.radians(heading_degrees), target_x, target_y, dt)
 
 def create_grid_graph_and_heuristics(grid, target):
     rows, cols = grid.shape
     target_r, target_c = target
-    
+
     graph = {}
     heuristics = {}
 
@@ -777,9 +861,8 @@ def main(args=None):
     is_simulation = run is None # Remember: pass --run test1|test2|full to ca2.sh when testing on the real lab setup
 
     print("Starting path planning")
-    # Let Python handle Ctrl+C so the stop command can be published before
-    # the ROS context is shut down in the finally block below.
-    rclpy.init(args=ros_args, signal_handler_options=SignalHandlerOptions.NO)
+    rclpy.init(args=ros_args)
+
 
     robot_number = 3
     frame = expected_start = None
