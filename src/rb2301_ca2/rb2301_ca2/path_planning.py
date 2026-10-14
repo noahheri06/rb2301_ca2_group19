@@ -8,9 +8,8 @@ import time
 import numpy as np
 import heapq
 import rclpy
-from rclpy.node import Node as ROSNode
+from rclpy.node import Node
 from rclpy.logging import set_logger_level, LoggingSeverity
-from rclpy.signals import SignalHandlerOptions
 
 from rclpy.qos import (
     ReliabilityPolicy,
@@ -60,7 +59,7 @@ sim_config = {
     "origin": (-1.0, -5.0),
     "resolution": occupancy_grid_resolution,
     "goal_list": [(3.5, -3.5), (3.3, 0.3), (2.5, -3.5), (-0.3, -3.7)],
-    "max_translate_velocity": 0.4,
+    "max_translate_velocity": 1.4,
 }
 
 IRL_RUNS = ("test1", "test2", "full")
@@ -136,46 +135,7 @@ def load_irl_config(run:str) -> dict:
     }
 
 
-def wrap_angle(angle):
-    '''Wrap an angle in radians to [-pi, pi), so turns take the shortest direction.'''
-    return (angle + np.pi) % (2 * np.pi) - np.pi
-
-
-class PIDController:
-    '''PID with bounded integral and conditional integration during saturation.'''
-    def __init__(self, kp, ki, kd, integral_limit, angular=False):
-        self.kp, self.ki, self.kd = kp, ki, kd
-        self.integral_limit = integral_limit
-        self.angular = angular
-        self.reset()
-
-    def reset(self):
-        self.integral = 0.0
-        self.previous_error = None
-
-    def update(self, error, dt, output_min, output_max):
-        derivative = 0.0
-        if self.previous_error is not None:
-            change = error - self.previous_error
-            # Crossing +/-180 degrees must not cause a derivative spike.
-            derivative = (wrap_angle(change) if self.angular else change) / dt
-
-        integral = float(np.clip(
-            self.integral + error * dt, -self.integral_limit, self.integral_limit
-        ))
-        output = self.kp * error + self.ki * integral + self.kd * derivative
-        # Integrate only if it will not push further into an output limit.
-        if not ((output > output_max and error > 0) or
-                (output < output_min and error < 0)):
-            self.integral = integral
-        else:
-            output = self.kp * error + self.ki * self.integral + self.kd * derivative
-
-        self.previous_error = error
-        return float(np.clip(output, output_min, output_max))
-
-
-class WaypointNode(ROSNode):
+class WaypointNode(Node):
     '''Node to calculate path and move robot towards given goal_coordinates, using pose info from either gazebo odometer or optitrack'''
     def __init__(self, map_array:np.array, goal_list:list, is_simulation:bool=True, origin:tuple=(0.0, 0.0), resolution:float=occupancy_grid_resolution,
                  frame:dict=None, robot_number:int=3, expected_start:tuple=None, calibrate:bool=False):
@@ -214,24 +174,10 @@ class WaypointNode(ROSNode):
 
         self.pose = None
         self.path = [] # Set this to your planned route (a list of grid-index tuples, in travel order) once you've computed it -- it'll automatically show up in the terminal map print
-        self.done = False
-        self.path_planned = False
-        self.waypoints = [] # World-coordinate targets, retaining corners and every goal
-        self.current_waypoint_idx = 0
-        self.goal_waypoint_indices = []
-        self.current_goal_idx = 0
-        self.goal_reached = False
-
-        # Position PID on the robot's forward and sideways axes, in metres.
-        # Integral control can overcome low-speed resistance in Gazebo.
-        self.forward_pid = PIDController(1.0, 0.5, 0.05, integral_limit=0.8)
-        self.sideways_pid = PIDController(1.0, 0.5, 0.05, integral_limit=0.8)
-        self.max_linear_speed = min(0.4 if is_simulation else 0.3, max_translate_velocity)
-        self.waypoint_tolerance = min(0.03, self.resolution * 0.15)
-        self.previous_control_time = None
-        goal_cell = world_to_grid(*self.goal_list[0], self.origin, self.resolution)
-        self.graph, self.heuristic = create_grid_graph_and_heuristics(self.map_array, goal_cell)
         self._last_printed_path = None
+
+        #added parameters for the code
+        self.route_planned = False
 
     def _print_calibration(self):
         '''--calibrate: twice a second, print the raw Optitrack pose next to the maze-frame pose and grid cell.'''
@@ -308,108 +254,14 @@ class WaypointNode(ROSNode):
         self.goal_reached = False
         self.waypoints = waypoints
         self.current_waypoint_idx = 0
-        self.forward_pid.reset()
-        self.sideways_pid.reset()
-
-    def _segment_waypoints(self, segment, goal):
-        '''Merge only collinear grid steps; never skip a corner or an exact goal.'''
-        cells = [segment[0]]
-        for index in range(1, len(segment) - 1):
-            previous, current, following = segment[index-1:index+2]
-            incoming = (current[0] - previous[0], current[1] - previous[1])
-            outgoing = (following[0] - current[0], following[1] - current[1])
-            if incoming != outgoing:
-                cells.append(current)
-        if cells[-1] != segment[-1]:
-            cells.append(segment[-1])
-
-        waypoints = [grid_to_world(*cell, self.origin, self.resolution) for cell in cells]
-        # Goals may be away from the centre of their containing cell.
-        if np.linalg.norm(np.asarray(waypoints[-1]) - goal) > 1e-9:
-            waypoints.append(tuple(goal))
-        return waypoints
-
-    def _plan_all_goals(self):
-        start_cell = world_to_grid(self.pose[0], self.pose[1], self.origin, self.resolution)
-        self.path = []
-        waypoints = []
-        self.goal_waypoint_indices = []
-
-        for goal_index, goal in enumerate(self.goal_list, start=1):
-            goal_cell = world_to_grid(*goal, self.origin, self.resolution)
-            if (start_cell not in self.graph or goal_cell not in self.graph or
-                    self.map_array[start_cell] == 99 or self.map_array[goal_cell] == 99):
-                self.get_logger().error(
-                    f"Start or goal is blocked or outside the map: {start_cell} -> {goal_cell}"
-                )
-                self.path = []
-                self.done = True
-                return False
-
-            self.graph, self.heuristic = create_grid_graph_and_heuristics(
-                self.map_array, goal_cell
-            )
-            problem = Problem(self.graph, start_cell, goal_cell)
-            segment = self.path_planning(
-                problem,
-                f=lambda node: node.path_cost + self.heuristic[node.state],
-            )
-            # The existing graph gives walls a high cost, rather than removing
-            # them. Refuse such a route if no collision-free route exists.
-            if not segment or any(self.map_array[cell] == 99 for cell in segment):
-                self.get_logger().error(f"No collision-free path to goal {goal_index}: {goal}")
-                self.path = []
-                self.done = True
-                return False
-
-            self.path.extend(segment if not self.path else segment[1:])
-            segment_waypoints = self._segment_waypoints(segment, goal)
-            if waypoints and np.linalg.norm(
-                    np.asarray(waypoints[-1]) - segment_waypoints[0]) < 1e-9:
-                segment_waypoints = segment_waypoints[1:]
-            waypoints.extend(segment_waypoints)
-            self.goal_waypoint_indices.append(len(waypoints) - 1)
-            self.get_logger().info(
-                f"Planned route to goal {goal_index}/{len(self.goal_list)}: {goal}"
-            )
-            start_cell = goal_cell
-
-        self.set_waypoints(waypoints)
-        self.path_planned = True
-        self.get_logger().info(
-            f"Full route contains {len(self.path)} grid cells and {len(waypoints)} waypoints"
-        )
-        return True
-
-    def path_planning(self, problem, f):
-        node = Node(problem.initial)
-        frontier = [node]
-        reached = {node.state: node.path_cost}
-
-        while frontier:
-            node = frontier.pop(0)
-
-            if problem.is_goal(node.state):
-                return (get_solution(node))#a list of points
-
-            children = expand(problem, node)
-            for child in children:
-                if child.state not in reached or child.path_cost < reached[child.state]:
-                    reached[child.state] = child.path_cost
-                    frontier = [n for n in frontier if n.state != child.state]
-                    frontier = [n for n in frontier if f(n) <= f(child)] + [child] + [n for n in frontier if f(n) > f(child)]
-
-
-        return None
 
     def timer_callback(self):
-        """Follow waypoints with forward/backward and strafe PID; never rotate."""
+        """Controller loop. Insert path planning and PID control logic here"""
         if self.pose is None:
-            return # Does not run until a pose arrives from Odom or Optitrack
-
-        now_wall = time.time()
-        if now_wall - getattr(self, "_last_pose_log", 0.0) >= 1.0:
-            self._last_pose_log = now_wall
+            return # Does not run if no pose received from Odom or Optitrack
+        now = time.time()
+        if now - getattr(self, "_last_pose_log", 0.0) >= 1.0: # at most once a second, so it does not bury the map / warnings below
+            self._last_pose_log = now
             self.get_logger().debug(f"Pose: {self.pose}")
 
         if self.calibrate:
@@ -418,186 +270,102 @@ class WaypointNode(ROSNode):
 
         self._check_start_once()
 
-        if self.done:
-            self.move_2D()
-            return
-
-        if not self.path_planned:
-            if not self._plan_all_goals():
-                self.move_2D()
-                return
-
         if self.path != self._last_printed_path: # Prints once immediately (map + start + goals), then again each time self.path changes
             self.print_map()
             self._last_printed_path = list(self.path)
 
-        now = self.get_clock().now().nanoseconds * 1e-9
-        dt = 0.05 if self.previous_control_time is None else now - self.previous_control_time
-        self.previous_control_time = now
-        if dt <= 0.0 or dt > 0.25:
-            self.forward_pid.reset()
-            self.sideways_pid.reset()
-            self.move_2D()
-            return
+        ###### INSERT CODE HERE ######
+        # self.move_2D(0.5)
 
-        x, y, heading_degrees = self.pose
-        # Consume reached targets, including coincident goals, in travel order.
-        while self.current_waypoint_idx < len(self.waypoints):
-            target_x, target_y = self.waypoints[self.current_waypoint_idx]
-            distance = float(np.hypot(target_x - x, target_y - y))
-            if distance > self.waypoint_tolerance:
-                break
-            while (self.current_goal_idx < len(self.goal_list) and
-                   self.goal_waypoint_indices[self.current_goal_idx] == self.current_waypoint_idx):
-                self.get_logger().info(
-                    f"Reached goal {self.current_goal_idx + 1}/{len(self.goal_list)}: "
-                    f"{self.goal_list[self.current_goal_idx]}"
-                )
-                self.current_goal_idx += 1
-            self.current_waypoint_idx += 1
-            self.forward_pid.reset()
-            self.sideways_pid.reset()
-
-        if self.current_waypoint_idx == len(self.waypoints):
-            self.done = True
-            self.goal_reached = True
-            self.move_2D()
-            self.get_logger().info("All goals reached; stopping")
-            return
-
-        # Waypoints are in world coordinates; move_2D expects robot-frame
-        # velocities. Rotate the position error into the robot's current axes.
-        heading = np.deg2rad(heading_degrees)
-        cos_heading, sin_heading = np.cos(heading), np.sin(heading)
-        dx, dy = target_x - x, target_y - y
-        forward_error = cos_heading * dx + sin_heading * dy
-        sideways_error = -sin_heading * dx + cos_heading * dy
-
-        forward_integral = self.forward_pid.integral
-        sideways_integral = self.sideways_pid.integral
-        forward_speed = self.forward_pid.update(
-            forward_error, dt, -self.max_linear_speed, self.max_linear_speed
-        )
-        sideways_speed = self.sideways_pid.update(
-            sideways_error, dt, -self.max_linear_speed, self.max_linear_speed
-         )
-
-        # Cap the vector magnitude, so diagonal movement also stays <= 0.4m/s.
-        speed = float(np.hypot(forward_speed, sideways_speed))
-        if speed > self.max_linear_speed:
-            scale = self.max_linear_speed / speed
-            forward_speed *= scale
-            sideways_speed *= scale
-            # Prevent integral windup when the combined speed is saturated.
-            if forward_error * forward_speed > 0:
-                self.forward_pid.integral = forward_integral
-            if sideways_error * sideways_speed > 0:
-                self.sideways_pid.integral = sideways_integral
-
-        self.move_2D(x=forward_speed, y=sideways_speed, turn=0.0)
+        #TODO change the get_adjacent function to get more complex routes
+        if not self.route_planned:
+            start_node = world_to_grid(self.pose[0], self.pose[1], self.origin, self.resolution)
+            goal_node = world_to_grid(self.goal_list[0][0], self.goal_list[0][1], self.origin, self.resolution)
+            print(f"start_node: {start_node}")
+            print(f"goal_node: {goal_node}")
+            print(f"resolution: {self.resolution}")
+            path = self.astar(start_node, goal_node, self.get_adjacent, self.step_cost, self.step_cost)
+            print(path)
+            
+            if path != None:
+                self.print_map() 
+                self.route_planned = True
+                self.path = path
         ###### INSERT CODE HERE ######
 
-def create_grid_graph_and_heuristics(grid, target):
-    rows, cols = grid.shape
-    target_r, target_c = target
-    
-    graph = {}
-    heuristics = {}
 
-    def is_wall(r, c):
-        # Treat out-of-bounds areas as walls
-        if r < 0 or r >= rows or c < 0 or c >= cols:
-            return True
-        return grid[r, c] == 99
+    def astar(self, start, goal_node, get_neighbors, cost, heuristic):
+        open_set = {start}
+        came_from = {}
+        
+        g_score = {start: 0.0}
+        f_score = {start: heuristic(start, goal_node)}
+        
+        while open_set:
+            # Find the node in open_set with the lowest f_score
+            current = min(open_set, key=lambda node: f_score.get(node, np.inf))
+            
+            if current == goal_node:
+                # Reconstruct and return the path
+                path = [current]
+                while current in came_from:
+                    current = came_from[current]
+                    path.append(current)
+                return path[::-1]
+                
+            open_set.remove(current)
+            
+            for neighbor in get_neighbors(current):
+                tentative_g_score = g_score[current] + cost(current, neighbor)
+                
+                # If we found a shorter path to neighbor
+                if tentative_g_score < g_score.get(neighbor, np.inf):
+                    came_from[neighbor] = current
+                    g_score[neighbor] = tentative_g_score
+                    f_score[neighbor] = tentative_g_score + heuristic(neighbor, goal_node)
+                    
+                    open_set.add(neighbor)
+                    
+        return None
 
-    def get_node_cost(r, c):
-        if grid[r, c] == 99:
-            return 10000
+    #V1, only diagonal and sideways
+    def get_adjacent(self, node):
+        x, y = node
+        candidates = []
 
-        direct_neighbors = [(r-1, c), (r+1, c), (r, c-1), (r, c+1)]
-        corner_neighbors = [(r-1, c-1), (r-1, c+1), (r+1, c-1), (r+1, c+1)]
+        max_x = len(self.map_array)
+        max_y = len(self.map_array[0]) if max_x > 0 else 0
+        
+        # All 8 directions
+        directions = [
+            (0, 1), (0, -1), (1, 0), (-1, 0),   
+            (1, 1), (1, -1), (-1, 1), (-1, -1)  
+        ]
+        
+        for dx, dy in directions:
+            nx, ny = x + dx, y + dy
 
-        if any(is_wall(nr, nc) for nr, nc in direct_neighbors):
-            return 4
+            #check if it is a valid move, for diagonals, both adjacent tiles must be free
+            if 0 <= nx < max_x and 0 <= ny < max_y:              
+                if self.map_array[nx][ny] == 0:
+                    if dx != 0 and dy != 0:
+                        node_1 = self.map_array[x + dx][y]
+                        node_2 = self.map_array[x][y + dy]
+                        if node_1 == 0 and node_2 == 0:
+                            candidates.append((nx, ny))
+                    else:
+                        candidates.append((nx, ny))
+                        
+        return candidates
 
-        if any(is_wall(nr, nc) for nr, nc in corner_neighbors):
-            return 3
-
-        return 2
-
-    # Movement directions (Up, Down, Left, Right)
-    movement_directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-
-    for r in range(rows):
-        for c in range(cols):
-            current_node = (r, c)
-            graph[current_node] = []
-
-            # Manhattan distance to the target
-            heuristics[current_node] = abs(r - target_r) + abs(c - target_c)
-
-            for dr, dc in movement_directions:
-                nr, nc = r + dr, c + dc
-                if 0 <= nr < rows and 0 <= nc < cols:
-                    target_cost = get_node_cost(nr, nc)
-                    graph[current_node].append(((nr, nc), target_cost))
-
-    return graph, heuristics
-
-
-class Problem:
-    def __init__(self, graph, initial, goal):
-        self.graph = graph
-        self.initial = initial
-        self.goal = goal
-
-    def actions(self, state):
-        return [next_state for next_state, local_cost in self.graph[state]]
-
-    def result(self, state, action):
-        return action
-
-    def action_cost(self, state, action, next_state):
-        for neighbor, local_cost in self.graph[state]:
-            if neighbor == next_state:
-                return local_cost
-
-    def is_goal(self, state):
-        return state == self.goal
-
-
-class Node:
-    def __init__(self, state, parent=None, action=None, path_cost=0, depth=0):
-        self.state = state
-        self.parent = parent
-        self.action = action
-        self.path_cost = path_cost
-        self.depth = depth
+    def step_cost(self, current, neighbour):
+        #eudclidean distance normalized by cell size, add a bit of a penalty to incentivise longer straight lines. 
+        cx, cy = current
+        nx, ny = neighbour
+        d = np.sqrt((cx - nx)**2 + (cy - ny)**2)
+        return d + 0.1
 
 
-def expand(problem, node):
-    children = []
-    for action in problem.actions(node.state):
-        next_state = problem.result(node.state, action)
-        local_cost = problem.action_cost(node.state, action, next_state)
-        children.append(Node(
-            state=next_state,
-            parent=node,
-            action=action,
-            path_cost=node.path_cost + local_cost,
-            depth=node.depth + 1,
-        ))
-    return children
-
-
-def get_solution(goal_node):
-    path = []
-    node = goal_node
-    while node is not None:
-        path.append(node.state)
-        node = node.parent
-    path.reverse()
-    return path
 
 
 class Grid():
@@ -777,9 +545,7 @@ def main(args=None):
     is_simulation = run is None # Remember: pass --run test1|test2|full to ca2.sh when testing on the real lab setup
 
     print("Starting path planning")
-    # Let Python handle Ctrl+C so the stop command can be published before
-    # the ROS context is shut down in the finally block below.
-    rclpy.init(args=ros_args, signal_handler_options=SignalHandlerOptions.NO)
+    rclpy.init(args=ros_args)
 
     robot_number = 3
     frame = expected_start = None
@@ -809,17 +575,14 @@ def main(args=None):
     waypoint = WaypointNode(map_array, config["goal_list"], is_simulation, config["origin"], config["resolution"],
                             frame=frame, robot_number=robot_number, expected_start=expected_start, calibrate=cli_args.calibrate)
 
-    # Keep spinning after completion to maintain zero velocity until shutdown.
+    # Start spinning the waypoint node and only stop once SystemExit error is raised within the node callback
     try:
         rclpy.spin(waypoint)
-    except (KeyboardInterrupt, SystemExit):
+    except SystemExit:
         print("Shutting down")
-    finally:
-        if rclpy.ok():
-            waypoint.move_2D()
-        waypoint.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+
+    waypoint.destroy_node()
+    rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
