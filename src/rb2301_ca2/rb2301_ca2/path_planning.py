@@ -10,6 +10,7 @@ import heapq
 import rclpy
 from rclpy.node import Node
 from rclpy.logging import set_logger_level, LoggingSeverity
+from typing import Dict, List, Optional, Tuple, TypedDict
 
 from rclpy.qos import (
     ReliabilityPolicy,
@@ -19,6 +20,12 @@ from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
 from PIL import Image
 from geometry_msgs.msg import Twist
+
+MoveVector = Tuple[int, int]
+
+class MoveData(TypedDict):
+    cost: float
+    restrictions: List[MoveVector]  # Relative (dx, dy) tiles that must be free
 
 
 np.set_printoptions(
@@ -178,6 +185,7 @@ class WaypointNode(Node):
 
         #added parameters for the code
         self.route_planned = False
+        self.move_table = self.precompute_astar_moves(n=self.map_array.shape[0], m=self.map_array.shape[1], max_radius=15)
 
     def _print_calibration(self):
         '''--calibrate: twice a second, print the raw Optitrack pose next to the maze-frame pose and grid cell.'''
@@ -275,24 +283,151 @@ class WaypointNode(Node):
             self._last_printed_path = list(self.path)
 
         ###### INSERT CODE HERE ######
-        # self.move_2D(0.5)
 
-        #TODO change the get_adjacent function to get more complex routes
         if not self.route_planned:
+            full_path = []
             start_node = world_to_grid(self.pose[0], self.pose[1], self.origin, self.resolution)
-            goal_node = world_to_grid(self.goal_list[0][0], self.goal_list[0][1], self.origin, self.resolution)
-            print(f"start_node: {start_node}")
-            print(f"goal_node: {goal_node}")
-            print(f"resolution: {self.resolution}")
-            path = self.astar(start_node, goal_node, self.get_adjacent, self.step_cost, self.step_cost)
-            print(path)
-            
-            if path != None:
-                self.print_map() 
-                self.route_planned = True
-                self.path = path
-        ###### INSERT CODE HERE ######
+            for goal_node in self.goal_list:
+                goal_node = world_to_grid(goal_node[0], goal_node[1], self.origin, self.resolution)
+                raw_path = self.astar(start_node, goal_node, self.get_adjacent, self.step_cost, self.heuristic)
+                path_part = self.simplify_path(raw_path)
+                full_path.extend(path_part[1:] if full_path else path_part)
+                start_node = goal_node
 
+            
+            
+            if full_path is not None:
+                self.route_planned = True
+                self.path = full_path
+                print("full_path:", full_path)
+                print("full path length:", len(full_path))
+            
+
+    def precompute_astar_moves(
+        self,
+        n: int,
+        m: int,
+        max_radius: Optional[float] = None,
+        clearance: float = math.sqrt(2) / 2,
+        epsilon: float = 1e-9,
+        include_target: bool = True,
+    ) -> Dict[MoveVector, MoveData]:
+        """
+        Precomputes all primitive (coprime) move vectors for an n x m grid
+        up to an optional Euclidean max_radius using a ray sieve and 90-degree
+        rotations, along with the relative grid cells that must be free.
+
+        Parameters:
+            n: Grid width (number of columns / x-dimension).
+            m: Grid height (number of rows / y-dimension).
+            max_radius: Maximum Euclidean length of a single move (sqrt(dx^2 + dy^2)).
+                        If None, generates moves across the entire n x m grid.
+            clearance: Minimum allowed distance from a wall center to the move segment.
+                    Default is sqrt(2)/2 (~0.7071), the center-to-corner radius of a 1x1 tile.
+            epsilon: Small tolerance for floating-point rounding errors.
+            include_target: Whether the destination tile (dx, dy) is included in the restriction list.
+
+        Returns:
+            Dictionary mapping each move (dx, dy) -> {'cost': float, 'restrictions': [(rx, ry), ...]}
+        """
+        # -------------------------------------------------------------------------
+        # 1. Generate Quadrant-1 primitive moves via Ray Sieve (bounded by max_radius)
+        # -------------------------------------------------------------------------
+        grid_limit = max(n, m)
+        if max_radius is not None:
+            limit = min(grid_limit, math.floor(max_radius + epsilon) + 1)
+            max_radius_sq = (max_radius + epsilon) ** 2
+        else:
+            limit = grid_limit
+            max_radius_sq = float("inf")
+
+        sieved = [[False] * limit for _ in range(limit)]
+        if limit > 0:
+            sieved[0][0] = True
+
+        q1_moves: List[MoveVector] = []
+
+        for dx in range(limit):
+            for dy in range(1, limit):
+                # Since dy increases monotonically, we can break the inner loop
+                # as soon as the move length exceeds max_radius.
+                if dx * dx + dy * dy > max_radius_sq:
+                    break
+
+                if not sieved[dx][dy]:
+                    q1_moves.append((dx, dy))
+                    # Cross out the entire ray: (k * dx, k * dy)
+                    k = 1
+                    while k * dx < limit and k * dy < limit:
+                        sieved[k * dx][k * dy] = True
+                        k += 1
+
+        # -------------------------------------------------------------------------
+        # 2. Rotate by 0°, 90°, 180°, and 270° and filter to the n x m grid bounds
+        # -------------------------------------------------------------------------
+        all_moves: List[MoveVector] = []
+        for dx, dy in q1_moves:
+            rotations = [
+                (dx, dy),    # 0°   (Quadrant 1 + positive Y-axis)
+                (dy, -dx),   # 90°  clockwise (Quadrant 4 + positive X-axis)
+                (-dx, -dy),  # 180° clockwise (Quadrant 3 + negative Y-axis)
+                (-dy, dx),   # 270° clockwise (Quadrant 2 + negative X-axis)
+            ]
+            for r_dx, r_dy in rotations:
+                if abs(r_dx) < n and abs(r_dy) < m:
+                    all_moves.append((r_dx, r_dy))
+
+        # -------------------------------------------------------------------------
+        # 3. Compute wall-clearance restrictions for each move vector
+        # -------------------------------------------------------------------------
+        threshold = clearance + epsilon
+        threshold_sq = threshold * threshold
+        pad = math.ceil(threshold)
+
+        move_table: Dict[MoveVector, MoveData] = {}
+
+        for dx, dy in all_moves:
+            len_sq = dx * dx + dy * dy
+            move_len = math.sqrt(len_sq)
+
+            # Bounding box around the segment from (0, 0) to (dx, dy)
+            min_x = min(0, dx) - pad
+            max_x = max(0, dx) + pad
+            min_y = min(0, dy) - pad
+            max_y = max(0, dy) + pad
+
+            restrictions: List[MoveVector] = []
+
+            for rx in range(min_x, max_x + 1):
+                for ry in range(min_y, max_y + 1):
+                    if rx == 0 and ry == 0:
+                        continue
+                    if not include_target and (rx == dx and ry == dy):
+                        continue
+
+                    # Project point P=(rx, ry) onto segment A=(0,0) -> B=(dx,dy)
+                    t = (rx * dx + ry * dy) / len_sq
+                    if t <= 0.0:
+                        continue
+                    elif t >= 1.0:
+                        if rx == dx and ry == dy:
+                            restrictions.append((rx, ry))
+                        continue
+                    else:
+                        cross = rx * dy - ry * dx
+                        dist_sq = (cross * cross) / len_sq
+                        if dist_sq <= threshold_sq:
+                            restrictions.append((rx, ry))
+
+            # Sort from closest to (0,0) to farthest so A* obstacle checks fail fast
+            restrictions.sort(key=lambda p: p[0] * p[0] + p[1] * p[1])
+
+            move_table[(dx, dy)] = {
+                "cost": move_len,
+                "restrictions": restrictions,
+            }
+
+        return move_table
 
     def astar(self, start, goal_node, get_neighbors, cost, heuristic):
         open_set = {start}
@@ -314,9 +449,11 @@ class WaypointNode(Node):
                 return path[::-1]
                 
             open_set.remove(current)
+            prev_node = came_from.get(current)
             
             for neighbor in get_neighbors(current):
-                tentative_g_score = g_score[current] + cost(current, neighbor)
+                # Pass prev_node so cost() knows if we are continuing straight or turning
+                tentative_g_score = g_score[current] + cost(current, neighbor, prev_node)
                 
                 # If we found a shorter path to neighbor
                 if tentative_g_score < g_score.get(neighbor, np.inf):
@@ -328,42 +465,85 @@ class WaypointNode(Node):
                     
         return None
 
-    #V1, only diagonal and sideways
+    # V2: Uses precomputed primitive moves and line-of-sight restrictions
     def get_adjacent(self, node):
         x, y = node
         candidates = []
 
         max_x = len(self.map_array)
         max_y = len(self.map_array[0]) if max_x > 0 else 0
-        
-        # All 8 directions
-        directions = [
-            (0, 1), (0, -1), (1, 0), (-1, 0),   
-            (1, 1), (1, -1), (-1, 1), (-1, -1)  
-        ]
-        
-        for dx, dy in directions:
+
+        for (dx, dy), data in self.move_table.items():
             nx, ny = x + dx, y + dy
 
-            #check if it is a valid move, for diagonals, both adjacent tiles must be free
-            if 0 <= nx < max_x and 0 <= ny < max_y:              
-                if self.map_array[nx][ny] == 0:
-                    if dx != 0 and dy != 0:
-                        node_1 = self.map_array[x + dx][y]
-                        node_2 = self.map_array[x][y + dy]
-                        if node_1 == 0 and node_2 == 0:
-                            candidates.append((nx, ny))
-                    else:
-                        candidates.append((nx, ny))
-                        
+            # 1. Check if destination tile is within grid bounds
+            if 0 <= nx < max_x and 0 <= ny < max_y:
+                # 2. Check that all required clearance tiles (including target) are free (0)
+                if all(
+                    0 <= x + rx < max_x
+                    and 0 <= y + ry < max_y
+                    and self.map_array[x + rx][y + ry] == 0
+                    for rx, ry in data["restrictions"]
+                ):
+                    candidates.append((nx, ny))
+
         return candidates
 
-    def step_cost(self, current, neighbour):
-        #eudclidean distance normalized by cell size, add a bit of a penalty to incentivise longer straight lines. 
+    def step_cost(self, current, neighbour, prev_node=None, turn_penalty=0.15):
         cx, cy = current
         nx, ny = neighbour
-        d = np.sqrt((cx - nx)**2 + (cy - ny)**2)
-        return d + 0.1
+        dx, dy = nx - cx, ny - cy
+
+        # Lookup precomputed Euclidean length if available, otherwise compute it
+        if hasattr(self, "move_table") and (dx, dy) in self.move_table:
+            d = self.move_table[(dx, dy)]["cost"]
+        else:
+            d = math.hypot(dx, dy)
+
+        # If there is a previous node, check if we repeated the exact same move vector
+        if prev_node is not None:
+            px, py = prev_node
+            prev_dx, prev_dy = cx - px, cy - py
+            if (dx, dy) != (prev_dx, prev_dy):
+                return d + turn_penalty
+
+        return d
+
+    def heuristic(self, node, goal):
+        # Pure Euclidean distance: strictly admissible (never overestimates)
+        return math.hypot(node[0] - goal[0], node[1] - goal[1])
+
+    def simplify_path(self, path):
+        """
+        Merges consecutive steps that share the same direction vector
+        so only turning waypoints (and start/goal) remain.
+        Example: [(0, 0), (2, 1), (4, 2), (5, 2)] -> [(0, 0), (4, 2), (5, 2)]
+        """
+        if not path or len(path) <= 2:
+            return path
+
+        simplified = [path[0]]
+
+        for i in range(1, len(path) - 1):
+            prev_x, prev_y = path[i - 1]
+            curr_x, curr_y = path[i]
+            next_x, next_y = path[i + 1]
+
+            # Incoming and outgoing move vectors at path[i]
+            dx1, dy1 = curr_x - prev_x, curr_y - prev_y
+            dx2, dy2 = next_x - curr_x, next_y - curr_y
+
+            # Keep path[i] only if the robot changes direction.
+            # (Cross product == 0 and dot product > 0 checks if both moves
+            # point in the exact same direction, even if step lengths differ)
+            same_direction = (dx1 * dy2 == dy1 * dx2) and (dx1 * dx2 + dy1 * dy2 > 0)
+            if not same_direction:
+                simplified.append(path[i])
+
+        simplified.append(path[-1])
+        return simplified
+
+    ###### INSERT CODE HERE ######
 
 
 
