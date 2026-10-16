@@ -476,9 +476,9 @@ class WaypointNode(Node):
         for (dx, dy), data in self.move_table.items():
             nx, ny = x + dx, y + dy
 
-            # 1. Check if destination tile is within grid bounds
+            #Check if destination tile is within grid bounds
             if 0 <= nx < max_x and 0 <= ny < max_y:
-                # 2. Check that all required clearance tiles (including target) are free (0)
+                #Check that all required clearance tiles are free (0)
                 if all(
                     0 <= x + rx < max_x
                     and 0 <= y + ry < max_y
@@ -489,16 +489,12 @@ class WaypointNode(Node):
 
         return candidates
 
-    def step_cost(self, current, neighbour, prev_node=None, turn_penalty=0.15):
+    def step_cost(self, current, neighbour, prev_node=None, turn_penalty=0.1):
         cx, cy = current
         nx, ny = neighbour
         dx, dy = nx - cx, ny - cy
 
-        # Lookup precomputed Euclidean length if available, otherwise compute it
-        if hasattr(self, "move_table") and (dx, dy) in self.move_table:
-            d = self.move_table[(dx, dy)]["cost"]
-        else:
-            d = math.hypot(dx, dy)
+        d = self.move_table[(dx, dy)]["cost"]
 
         # If there is a previous node, check if we repeated the exact same move vector
         if prev_node is not None:
@@ -510,14 +506,12 @@ class WaypointNode(Node):
         return d
 
     def heuristic(self, node, goal):
-        # Pure Euclidean distance: strictly admissible (never overestimates)
         return math.hypot(node[0] - goal[0], node[1] - goal[1])
 
     def simplify_path(self, path):
         """
         Merges consecutive steps that share the same direction vector
         so only turning waypoints (and start/goal) remain.
-        Example: [(0, 0), (2, 1), (4, 2), (5, 2)] -> [(0, 0), (4, 2), (5, 2)]
         """
         if not path or len(path) <= 2:
             return path
@@ -529,13 +523,9 @@ class WaypointNode(Node):
             curr_x, curr_y = path[i]
             next_x, next_y = path[i + 1]
 
-            # Incoming and outgoing move vectors at path[i]
             dx1, dy1 = curr_x - prev_x, curr_y - prev_y
             dx2, dy2 = next_x - curr_x, next_y - curr_y
 
-            # Keep path[i] only if the robot changes direction.
-            # (Cross product == 0 and dot product > 0 checks if both moves
-            # point in the exact same direction, even if step lengths differ)
             same_direction = (dx1 * dy2 == dy1 * dx2) and (dx1 * dx2 + dy1 * dy2 > 0)
             if not same_direction:
                 simplified.append(path[i])
