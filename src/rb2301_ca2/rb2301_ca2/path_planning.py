@@ -184,8 +184,10 @@ class WaypointNode(Node):
         self._last_printed_path = None
 
         #added parameters for the code
+        self.i = 0 #debug param
+        self.prev_pose = None
         self.route_planned = False
-        self.move_table = self.precompute_astar_moves(n=self.map_array.shape[0], m=self.map_array.shape[1], max_radius=15)
+        self.move_table = self.precompute_astar_moves(n=self.map_array.shape[0], m=self.map_array.shape[1], max_radius=7)
 
     def _print_calibration(self):
         '''--calibrate: twice a second, print the raw Optitrack pose next to the maze-frame pose and grid cell.'''
@@ -294,13 +296,23 @@ class WaypointNode(Node):
                 full_path.extend(path_part[1:] if full_path else path_part)
                 start_node = goal_node
 
-            
-            
             if full_path is not None:
                 self.route_planned = True
                 self.path = full_path
+                self.follower = WaypointFollower(waypoints=[grid_to_world(i, j, self.origin, self.resolution) for i, j in full_path], max_v=0.3, max_w=180, kp_v=0.8, kd_v=0.1, kp_w=5.0, kd_w=1, ki_w=0.05)
                 print("full_path:", full_path)
                 print("full path length:", len(full_path))
+
+        if self.route_planned:
+            v, w, is_finished = self.follower.update(self.pose[0], self.pose[1], math.radians(self.pose[2]), dt=0.05)
+            self.i += 1
+            if self.i % 20 == 0: # Print every second
+                print("v:", v, "w:", w)
+                print("actual v", math.hypot(self.pose[0] - self.prev_pose[0], self.pose[1] - self.prev_pose[1]) / 0.05, "actual w:", ((self.pose[2] - self.prev_pose[2]) / 0.05))
+            if is_finished():
+                self.get_logger().info("All waypoints reached. Stopping robot.")
+            self.move_2D(x=v, turn=w)
+            self.prev_pose = self.pose
             
 
     def precompute_astar_moves(
@@ -533,7 +545,127 @@ class WaypointNode(Node):
         simplified.append(path[-1])
         return simplified
 
-    ###### INSERT CODE HERE ######
+
+class PDController:
+    """Generic Proportional-Derivative (PD) controller with output clamping."""
+    def __init__(self, kp: float, kd: float, ki: float, min_out: float, max_out: float):
+        self.kp = kp
+        self.kd = kd
+        self.ki = ki
+        self.min_out = min_out
+        self.max_out = max_out
+        self.prev_error = None
+        self.integral = 0.0
+
+    def reset(self):
+        """Reset derivative memory (call when switching waypoints)."""
+        self.prev_error = None
+        self.integral = 0.0
+
+    def compute(self, error: float, dt: float) -> float:
+        if dt <= 0.0:
+            return 0.0
+
+        # Derivative term (avoid spike on the very first step)
+        if self.prev_error is None:
+            d_error = 0.0
+        else:
+            d_error = (error - self.prev_error) / dt
+
+        self.prev_error = error
+
+        # PD Output with clamping
+        self.integral += error * dt
+        output = (self.kp * error) + (self.kd * d_error) + (self.ki * self.integral)
+        return max(self.min_out, min(self.max_out, output))
+
+
+class WaypointFollower:
+    def __init__(
+        self,
+        waypoints: list[tuple[float, float]],
+        waypoint_tolerance: float = 0.15,     # Distance (m) to switch to next waypoint
+        align_threshold_deg: float = 25.0,    # Max heading error (deg) before driving forward
+        max_v: float = 0.3,                   # Max forward velocity (m/s)
+        max_w: float = 1.2,                   # Max angular velocity (rad/s)
+        kp_v: float = 0.8, kd_v: float = 0.1, ki_v: float = 0.01 , # Linear PD gains
+        kp_w: float = 2.0, kd_w: float = 0.2, ki_w: float = 0.02   # Angular PD gains
+
+    ):
+        self.waypoints = waypoints
+        self.wp_idx = 0
+        self.waypoint_tolerance = waypoint_tolerance
+        self.align_threshold = math.radians(align_threshold_deg)
+
+        # Initialize the two PD controllers
+        self.linear_pd = PDController(kp_v, kd_v, ki_v, min_out=0.0, max_out=max_v)
+        self.angular_pd = PDController(kp_w, kd_w, ki_w, min_out=-max_w, max_out=max_w)
+
+    @staticmethod
+    def wrap_angle(angle: float) -> float:
+        """Wraps any angle in radians to the range [-pi, pi]."""
+        return math.atan2(math.sin(angle), math.cos(angle))
+
+    def is_finished(self) -> bool:
+        return self.wp_idx >= len(self.waypoints)
+
+    def update(self, x: float, y: float, theta: float, dt: float) -> tuple[float, float]:
+        """
+        Main control step. Call this at a fixed rate in your control loop.
+        Returns: (linear_velocity_v, angular_velocity_omega)
+        """
+        if self.is_finished():
+            return 0.0, 0.0
+
+        target_x, target_y = self.waypoints[self.wp_idx]
+
+        # 1. Calculate distance error
+        dx = target_x - x
+        dy = target_y - y
+        dist_error = math.hypot(dx, dy)
+
+        # 2. Check if we are close enough to advance to the next waypoint
+        if dist_error < self.waypoint_tolerance:
+            self.wp_idx += 1
+            self.linear_pd.reset()
+            self.angular_pd.reset()
+            
+            # If that was the final waypoint, stop the robot
+            if self.is_finished():
+                return 0.0, 0.0, self.is_finished()
+                
+            # Otherwise, immediately recompute errors for the new waypoint
+            target_x, target_y = self.waypoints[self.wp_idx]
+            dx = target_x - x
+            dy = target_y - y
+            dist_error = math.hypot(dx, dy)
+
+        # 3. Calculate target heading and wrapped heading error
+        target_heading = math.atan2(dy, dx)
+        
+        # --- FUTURE HOOK: Wall / Obstacle Avoidance ---
+        # Later, you can blend or offset `target_heading` with a repulsive vector
+        # from LiDAR/ultrasonic sensors here before computing `heading_error`.
+        
+        heading_error = self.wrap_angle(target_heading - theta)
+
+        # 4. Compute angular velocity (always active)
+        omega = self.angular_pd.compute(heading_error, dt)
+
+        # 5. Compute forward velocity with heading-alignment logic
+        if abs(heading_error) > self.align_threshold:
+            # Heading is too far off: pivot in place first
+            v = 0.0
+            # Reset linear D-term so it doesn't spike when forward motion starts
+            self.linear_pd.reset()
+        else:
+            # Heading is within threshold: drive forward and scale by cosine of error
+            # so the robot naturally slows down slightly during sharper adjustments
+            v_raw = self.linear_pd.compute(dist_error, dt)
+            v = v_raw * math.cos(heading_error)
+
+        return v, omega, self.is_finished
+    ###### INSERT CODE HERE #######
 
 
 
