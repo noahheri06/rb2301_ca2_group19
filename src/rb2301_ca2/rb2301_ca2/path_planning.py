@@ -344,6 +344,7 @@ class WaypointNode(ROSNode):
         self.goal_reached = False
         self.waypoints = waypoints
         self.current_waypoint_idx = 0
+        self.current_goal_idx = 0
         self.motion_state = "STOP"
         self.settle_elapsed = 0.0
         self.segment_start = None
@@ -416,7 +417,7 @@ class WaypointNode(ROSNode):
         return turn + math.copysign(compensation, error)
 
     def _segment_waypoints(self, segment, goal):
-        '''Merge only collinear grid steps; never skip a corner or an exact goal.'''
+        '''Convert a grid path to turn waypoints, preserving its start and exact goal.'''
         cells = [segment[0]]
         for index in range(1, len(segment) - 1):
             previous, current, following = segment[index-1:index+2]
@@ -428,9 +429,12 @@ class WaypointNode(ROSNode):
             cells.append(segment[-1])
 
         waypoints = [grid_to_world(*cell, self.origin, self.resolution) for cell in cells]
-        # Goals may be away from the centre of their containing cell.
+        # Goals may be away from the centre of their containing cell. Always
+        # retain the exact goal, including when start and goal share one cell.
         if np.linalg.norm(np.asarray(waypoints[-1]) - goal) > 1e-9:
             waypoints.append(tuple(goal))
+        else:
+            waypoints[-1] = tuple(goal)
         return waypoints
 
     def _plan_all_goals(self):
@@ -439,36 +443,50 @@ class WaypointNode(ROSNode):
         waypoints = []
         self.goal_waypoint_indices = []
 
+        rows, columns = self.map_array.shape
+
+        def is_free(cell):
+            return (0 <= cell[0] < rows and 0 <= cell[1] < columns
+                    and self.map_array[cell] == 0)
+
+        if not is_free(start_cell):
+            self.get_logger().error(f"Robot start cell is blocked or outside the map: {start_cell}")
+            self.path = []
+            self.done = True
+            return False
+
         for goal_index, goal in enumerate(self.goal_list, start=1):
             goal_cell = world_to_grid(*goal, self.origin, self.resolution)
-            if (start_cell not in self.graph or goal_cell not in self.graph or
-                    self.map_array[start_cell] == 99 or self.map_array[goal_cell] == 99):
+            if not is_free(goal_cell):
                 self.get_logger().error(
-                    f"Start or goal is blocked or outside the map: {start_cell} -> {goal_cell}"
+                    f"Goal {goal_index} is blocked or outside the map: {goal_cell}"
                 )
                 self.path = []
                 self.done = True
                 return False
 
-            self.graph, self.heuristic = create_grid_graph_and_heuristics(
-                self.map_array, goal_cell
+            raw_segment = self.astar(
+                start_cell,
+                goal_cell,
+                self.get_adjacent,
+                self.step_cost,
+                self.heuristic,
             )
-            problem = Problem(self.graph, start_cell, goal_cell)
-            segment = self.path_planning(
-                problem,
-                f=lambda node: node.path_cost + self.heuristic[node.state],
-            )
-            # The existing graph gives walls a high cost, rather than removing
-            # them. Refuse such a route if no collision-free route exists.
-            if not segment or any(self.map_array[cell] == 99 for cell in segment):
+            if raw_segment is None:
                 self.get_logger().error(f"No collision-free path to goal {goal_index}: {goal}")
                 self.path = []
                 self.done = True
                 return False
 
+            segment = self.simplify_path(raw_segment)
             self.path.extend(segment if not self.path else segment[1:])
             segment_waypoints = self._segment_waypoints(segment, goal)
-            if waypoints and np.linalg.norm(
+            # The robot is already at the first leg's start. For later legs,
+            # retain the start-cell centre so an off-centre goal does not make
+            # the controller cut directly across the next planned segment.
+            if not waypoints and len(segment) > 1:
+                segment_waypoints = segment_waypoints[1:]
+            elif np.linalg.norm(
                     np.asarray(waypoints[-1]) - segment_waypoints[0]) < 1e-9:
                 segment_waypoints = segment_waypoints[1:]
             waypoints.extend(segment_waypoints)
@@ -484,42 +502,6 @@ class WaypointNode(ROSNode):
             f"Full route contains {len(self.path)} grid cells and {len(waypoints)} waypoints"
         )
         return True
-
-    def path_planning(self, problem, f):
-
-        def direction(node):
-            if node.parent is None:
-                return None
-
-            previous = node.parent.state
-            current = node.state
-            return (current[0] - previous[0],current[1] - previous[1])
-    
-        node = Node(problem.initial)
-        frontier = [node]
-        reached = {node.state: node.path_cost}
-
-        while frontier:
-            node = frontier.pop(0)
-
-            if problem.is_goal(node.state):
-                return (get_solution(node))#a list of points
-
-            previous_direction = direction(node)
-
-            children = expand(problem, node)
-            for child in children:
-
-                if previous_direction is not None and previous_direction != direction(child):
-                    child.path_cost += 0.3
-
-                if child.state not in reached or child.path_cost < reached[child.state]:
-                    reached[child.state] = child.path_cost
-                    frontier = [n for n in frontier if n.state != child.state]
-                    frontier = [n for n in frontier if f(n) <= f(child)] + [child] + [n for n in frontier if f(n) > f(child)]
-
-
-        return None
 
     def timer_callback(self):
         if self.pose is None:
@@ -540,21 +522,12 @@ class WaypointNode(ROSNode):
             self.move_2D()
             return
 
-        if not self.path_planned:
-            full_path = []
-            start_node = world_to_grid(self.pose[0], self.pose[1], self.origin, self.resolution)
-            for goal_node in self.goal_list:
-                goal_node = world_to_grid(goal_node[0], goal_node[1], self.origin, self.resolution)
-                raw_path = self.astar(start_node, goal_node, self.get_adjacent, self.step_cost, self.heuristic)
-                path_part = self.simplify_path(raw_path)
-                full_path.extend(path_part[1:] if full_path else path_part)
-                start_node = goal_node
-
-            if full_path is not None:
-                self.route_planned = True
-                self.path = full_path
-                self.waypoints = [grid_to_world(node[0], node[1], self.origin, self.resolution) for node in full_path]
-                self.goal_waypoint_indices = [len(self.waypoints) - 1] * len(self.goal_list)
+        if not self.path_planned and not self._plan_all_goals():
+            self.path_planned = True
+            self.waypoints = []
+            self.goal_waypoint_indices = []
+            self.move_2D()
+            return
 
 
         if self.path != self._last_printed_path: # Prints once immediately (map + start + goals), then again each time self.path changes
@@ -618,8 +591,8 @@ class WaypointNode(ROSNode):
         n: int,
         m: int,
         max_radius: Optional[float] = None,
-        clearance: float = math.sqrt(2) / 2,
-        epsilon: float = 1e-9,
+        clearance: float = 1,
+        epsilon: float = 0,
         include_target: bool = True,
     ) -> Dict[MoveVector, MoveData]:
         """
@@ -740,39 +713,41 @@ class WaypointNode(ROSNode):
         return move_table
 
     def astar(self, start, goal_node, get_neighbors, cost, heuristic):
-        open_set = {start}
+        # Include the incoming edge in the state. The turn penalty depends on
+        # direction, so keeping only one score per cell can discard the best
+        # route to that cell.
+        start_state = (start, None)
         came_from = {}
-        
-        g_score = {start: 0.0}
-        f_score = {start: heuristic(start, goal_node)}
-        
-        while open_set:
-            # Find the node in open_set with the lowest f_score
-            current = min(open_set, key=lambda node: f_score.get(node, np.inf))
-            
+        g_score = {start_state: 0.0}
+        frontier = []
+        sequence = 0
+        heapq.heappush(frontier, (heuristic(start, goal_node), sequence, 0.0, start_state))
+
+        while frontier:
+            _, _, current_cost, state = heapq.heappop(frontier)
+            if current_cost > g_score.get(state, np.inf):
+                continue
+
+            current, previous = state
             if current == goal_node:
-                # Reconstruct and return the path
                 path = [current]
-                while current in came_from:
-                    current = came_from[current]
-                    path.append(current)
+                while state in came_from:
+                    state = came_from[state]
+                    path.append(state[0])
                 return path[::-1]
-                
-            open_set.remove(current)
-            prev_node = came_from.get(current)
-            
+
             for neighbor in get_neighbors(current):
-                # Pass prev_node so cost() knows if we are continuing straight or turning
-                tentative_g_score = g_score[current] + cost(current, neighbor, prev_node)
-                
-                # If we found a shorter path to neighbor
-                if tentative_g_score < g_score.get(neighbor, np.inf):
-                    came_from[neighbor] = current
-                    g_score[neighbor] = tentative_g_score
-                    f_score[neighbor] = tentative_g_score + heuristic(neighbor, goal_node)
-                    
-                    open_set.add(neighbor)
-                    
+                next_cost = current_cost + cost(current, neighbor, previous)
+                next_state = (neighbor, current)
+                if next_cost < g_score.get(next_state, np.inf):
+                    came_from[next_state] = state
+                    g_score[next_state] = next_cost
+                    sequence += 1
+                    priority = next_cost + heuristic(neighbor, goal_node)
+                    heapq.heappush(
+                        frontier, (priority, sequence, next_cost, next_state)
+                    )
+
         return None
 
     # V2: Uses precomputed primitive moves and line-of-sight restrictions
@@ -842,121 +817,6 @@ class WaypointNode(ROSNode):
 
         simplified.append(path[-1])
         return simplified
-
-def create_grid_graph_and_heuristics(grid, target):
-    rows, cols = grid.shape
-    target_r, target_c = target
-
-    graph = {}
-    heuristics = {}
-
-    def is_wall(r, c):
-        # Treat out-of-bounds areas as walls
-        if r < 0 or r >= rows or c < 0 or c >= cols:
-            return True
-        return grid[r, c] == 99
-
-    def get_node_cost(r, c):
-        if grid[r, c] == 99:
-            return 10000
-
-        direct_neighbors = [(r-1, c), (r+1, c), (r, c-1), (r, c+1)]
-        corner_neighbors = [(r-1, c-1), (r-1, c+1), (r+1, c-1), (r+1, c+1)]
-
-        if any(is_wall(nr, nc) for nr, nc in direct_neighbors):
-            return 3
-
-        if any(is_wall(nr, nc) for nr, nc in corner_neighbors):
-            return 2
-
-        return 1
-
-    # Movement directions
-    movement_directions = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]  # Including diagonal movements 
-
-    for r in range(rows):
-        for c in range(cols):
-            current_node = (r, c)
-            graph[current_node] = []
-
-            # Euclidean distance to the target
-            #heuristics[current_node] = ((r - target_r)**2 + (c - target_c)**2)**0.5
-
-            row_distance = abs(r - target_r)
-            col_distance = abs(c - target_c)
-
-            heuristics[current_node] = max(row_distance, col_distance) + (2**0.5 - 1) * min(row_distance, col_distance)
-            
-
-            for dr, dc in movement_directions:
-                nr, nc = r + dr, c + dc
-                if 0 <= nr < rows and 0 <= nc < cols:
-                    target_cost = get_node_cost(nr, nc)
-                    if dr != 0 and dc != 0:
-                        node1 = grid[r+dr][c]
-                        node2 = grid[r][c+dc]
-                        if node1 == 99 or node2 == 99:
-                            continue
-                        target_cost *= 2**0.5
-                    graph[current_node].append(((nr, nc), target_cost))
-
-    return graph, heuristics
-
-
-class Problem:
-    def __init__(self, graph, initial, goal):
-        self.graph = graph
-        self.initial = initial
-        self.goal = goal
-
-    def actions(self, state):
-        return [next_state for next_state, local_cost in self.graph[state]]
-
-    def result(self, state, action):
-        return action
-
-    def action_cost(self, state, action, next_state):
-        for neighbor, local_cost in self.graph[state]:
-            if neighbor == next_state:
-                return local_cost
-
-    def is_goal(self, state):
-        return state == self.goal
-
-
-class Node:
-    def __init__(self, state, parent=None, action=None, path_cost=0, depth=0):
-        self.state = state
-        self.parent = parent
-        self.action = action
-        self.path_cost = path_cost
-        self.depth = depth
-
-
-def expand(problem, node):
-    children = []
-    for action in problem.actions(node.state):
-        next_state = problem.result(node.state, action)
-        local_cost = problem.action_cost(node.state, action, next_state)
-        children.append(Node(
-            state=next_state,
-            parent=node,
-            action=action,
-            path_cost=node.path_cost + local_cost,
-            depth=node.depth + 1,
-        ))
-    return children
-
-
-def get_solution(goal_node):
-    path = []
-    node = goal_node
-    while node is not None:
-        path.append(node.state)
-        node = node.parent
-    path.reverse()
-    return path
-
 
 class Grid():
     '''
