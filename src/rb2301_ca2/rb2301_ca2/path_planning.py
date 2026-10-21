@@ -578,7 +578,7 @@ class PDController:
 class WaypointFollower:
     def __init__(
         self,
-        waypoints: list[tuple[float, float]],
+        waypoints: List[Tuple[float, float]],
         waypoint_tolerance: float = 0.15,     # Distance (m) to switch to next waypoint
         align_threshold_deg: float = 25.0,    # Max heading error (deg) before driving forward
         max_v: float = 0.3,                   # Max forward velocity (m/s)
@@ -609,7 +609,7 @@ class WaypointFollower:
     def is_finished_f(self) -> bool:
         return self.wp_idx >= len(self.waypoints)
 
-    def update(self, x: float, y: float, theta: float, dt: float) -> tuple[float, float]:
+    def update(self, x: float, y: float, theta: float, dt: float) -> Tuple[float, float, bool]:
         """
         Main control step. Call this at a fixed rate in your control loop.
         Returns: (linear_velocity_v, angular_velocity_omega)
@@ -617,7 +617,8 @@ class WaypointFollower:
         self.is_finished = self.is_finished_f()
 
         if self.is_finished:
-            return 0.0, 0.0
+            return 0.0, 0.0, self.is_finished
+            
 
         target_x, target_y = self.waypoints[self.wp_idx]
 
@@ -629,6 +630,7 @@ class WaypointFollower:
         # 2. Check if we are close enough to advance to the next waypoint
         if dist_error < self.waypoint_tolerance:
             self.wp_idx += 1
+            self.is_finished = self.is_finished_f()
             self.linear_pd.reset()
             self.angular_pd.reset()
             
