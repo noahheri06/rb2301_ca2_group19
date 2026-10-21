@@ -304,6 +304,7 @@ class WaypointNode(Node):
         if self.route_planned:
             v, w, is_finished = self.follower.update(self.pose[0], self.pose[1], math.radians(self.pose[2]), dt=0.05)
             if is_finished:
+                print(is_finished)
                 self.get_logger().info("All waypoints reached. Stopping robot.")
             self.move_2D(x=v, turn=w)
             self.prev_pose = self.pose
@@ -598,13 +599,14 @@ class WaypointFollower:
         # Initialize the two PD controllers
         self.linear_pd = PDController(kp_v, kd_v, ki_v, min_out=0.0, max_out=max_v)
         self.angular_pd = PDController(kp_w, kd_w, ki_w, min_out=-max_w, max_out=max_w)
+        self.is_finished = False
 
     @staticmethod
     def wrap_angle(angle: float) -> float:
         """Wraps any angle in radians to the range [-pi, pi]."""
         return math.atan2(math.sin(angle), math.cos(angle))
 
-    def is_finished(self) -> bool:
+    def is_finished_f(self) -> bool:
         return self.wp_idx >= len(self.waypoints)
 
     def update(self, x: float, y: float, theta: float, dt: float) -> tuple[float, float]:
@@ -612,7 +614,9 @@ class WaypointFollower:
         Main control step. Call this at a fixed rate in your control loop.
         Returns: (linear_velocity_v, angular_velocity_omega)
         """
-        if self.is_finished():
+        self.is_finished = self.is_finished_f()
+
+        if self.is_finished:
             return 0.0, 0.0
 
         target_x, target_y = self.waypoints[self.wp_idx]
@@ -629,8 +633,8 @@ class WaypointFollower:
             self.angular_pd.reset()
             
             # If that was the final waypoint, stop the robot
-            if self.is_finished():
-                return 0.0, 0.0, self.is_finished()
+            if self.is_finished:
+                return 0.0, 0.0, self.is_finished
                 
             # Otherwise, immediately recompute errors for the new waypoint
             target_x, target_y = self.waypoints[self.wp_idx]
