@@ -184,8 +184,6 @@ class WaypointNode(Node):
         self._last_printed_path = None
 
         #added parameters for the code
-        self.i = 0 #debug param
-        self.prev_pose = None
         self.route_planned = False
         self.move_table = self.precompute_astar_moves(n=self.map_array.shape[0], m=self.map_array.shape[1], max_radius=7)
 
@@ -299,17 +297,13 @@ class WaypointNode(Node):
             if full_path is not None:
                 self.route_planned = True
                 self.path = full_path
-                self.follower = WaypointFollower(waypoints=[grid_to_world(i, j, self.origin, self.resolution) for i, j in full_path], max_v=0.3, max_w=180, kp_v=0.8, kd_v=0.1, kp_w=5.0, kd_w=1, ki_w=0.05)
+                self.follower = WaypointFollower(waypoints=[grid_to_world(i, j, self.origin, self.resolution) for i, j in full_path], max_v=1.4, max_w=3, kp_v=0.8, kd_v=0.1, kp_w=5.0, kd_w=1, ki_w=0.05, map_array=self.map_array, origin=self.origin, resolution=self.resolution, influence_distance=0.3)
                 print("full_path:", full_path)
                 print("full path length:", len(full_path))
 
         if self.route_planned:
             v, w, is_finished = self.follower.update(self.pose[0], self.pose[1], math.radians(self.pose[2]), dt=0.05)
-            self.i += 1
-            if self.i % 20 == 0: # Print every second
-                print("v:", v, "w:", w)
-                print("actual v", math.hypot(self.pose[0] - self.prev_pose[0], self.pose[1] - self.prev_pose[1]) / 0.05, "actual w:", ((self.pose[2] - self.prev_pose[2]) / 0.05))
-            if is_finished():
+            if is_finished:
                 self.get_logger().info("All waypoints reached. Stopping robot.")
             self.move_2D(x=v, turn=w)
             self.prev_pose = self.pose
@@ -320,8 +314,8 @@ class WaypointNode(Node):
         n: int,
         m: int,
         max_radius: Optional[float] = None,
-        clearance: float = math.sqrt(2) / 2,
-        epsilon: float = 1e-9,
+        clearance: float = 0.99,
+        epsilon: float = 0,
         include_target: bool = True,
     ) -> Dict[MoveVector, MoveData]:
         """
@@ -335,7 +329,7 @@ class WaypointNode(Node):
             max_radius: Maximum Euclidean length of a single move (sqrt(dx^2 + dy^2)).
                         If None, generates moves across the entire n x m grid.
             clearance: Minimum allowed distance from a wall center to the move segment.
-                    Default is sqrt(2)/2 (~0.7071), the center-to-corner radius of a 1x1 tile.
+                    Default is 0.99, ensuring a safe distance from obstacles.
             epsilon: Small tolerance for floating-point rounding errors.
             include_target: Whether the destination tile (dx, dy) is included in the restriction list.
 
@@ -589,13 +583,17 @@ class WaypointFollower:
         max_v: float = 0.3,                   # Max forward velocity (m/s)
         max_w: float = 1.2,                   # Max angular velocity (rad/s)
         kp_v: float = 0.8, kd_v: float = 0.1, ki_v: float = 0.01 , # Linear PD gains
-        kp_w: float = 2.0, kd_w: float = 0.2, ki_w: float = 0.02   # Angular PD gains
+        kp_w: float = 2.0, kd_w: float = 0.2, ki_w: float = 0.02,  # Angular PD gains
+        map_array: Optional[np.ndarray] = None, origin: tuple = (0.0, 0.0), resolution: float = occupancy_grid_resolution,
+        influence_distance: float = 0.3
 
     ):
         self.waypoints = waypoints
         self.wp_idx = 0
         self.waypoint_tolerance = waypoint_tolerance
         self.align_threshold = math.radians(align_threshold_deg)
+        self.map_array, self.origin, self.resolution = map_array, origin, resolution
+        self.influence_distance = influence_distance
 
         # Initialize the two PD controllers
         self.linear_pd = PDController(kp_v, kd_v, ki_v, min_out=0.0, max_out=max_v)
@@ -643,9 +641,24 @@ class WaypointFollower:
         # 3. Calculate target heading and wrapped heading error
         target_heading = math.atan2(dy, dx)
         
-        # --- FUTURE HOOK: Wall / Obstacle Avoidance ---
-        # Later, you can blend or offset `target_heading` with a repulsive vector
-        # from LiDAR/ultrasonic sensors here before computing `heading_error`.
+        # If a mapped wall is close ahead on one side, bias the heading away from it.
+        if self.map_array is not None:
+            i, j = world_to_grid(x, y, self.origin, self.resolution)
+            radius = math.ceil(self.influence_distance / self.resolution)
+            i0, i1 = max(0, i - radius), min(self.map_array.shape[0], i + radius + 1)
+            j0, j1 = max(0, j - radius), min(self.map_array.shape[1], j + radius + 1)
+            walls = np.argwhere(self.map_array[i0:i1, j0:j1] > 50) + (i0, j0)
+            left_wall = right_wall = False
+            for wi, wj in walls:
+                wx, wy = grid_to_world(wi, wj, self.origin, self.resolution)
+                rx, ry = wx - x, wy - y
+                if math.hypot(rx, ry) <= self.influence_distance and rx * math.cos(theta) + ry * math.sin(theta) > 0:
+                    if rx * -math.sin(theta) + ry * math.cos(theta) > 0:
+                        left_wall = True
+                    else:
+                        right_wall = True
+            if left_wall != right_wall:
+                target_heading += -0.5 if left_wall else 0.5
         
         heading_error = self.wrap_angle(target_heading - theta)
 
@@ -653,7 +666,7 @@ class WaypointFollower:
         omega = self.angular_pd.compute(heading_error, dt)
 
         # 5. Compute forward velocity with heading-alignment logic
-        if abs(heading_error) > self.align_threshold:
+        if (abs(heading_error) > self.align_threshold) and (dist_error > self.waypoint_tolerance):
             # Heading is too far off: pivot in place first
             v = 0.0
             # Reset linear D-term so it doesn't spike when forward motion starts
@@ -664,7 +677,7 @@ class WaypointFollower:
             v_raw = self.linear_pd.compute(dist_error, dt)
             v = v_raw * math.cos(heading_error)
 
-        return v, omega, self.is_finished
+        return v, (omega if dist_error > self.waypoint_tolerance else 0), self.is_finished
     ###### INSERT CODE HERE #######
 
 
