@@ -297,7 +297,7 @@ class WaypointNode(Node):
             if full_path is not None:
                 self.route_planned = True
                 self.path = full_path
-                self.follower = WaypointFollower(waypoints=[grid_to_world(i, j, self.origin, self.resolution) for i, j in full_path], max_v=1.4, max_w=3, kp_v=0.8, kd_v=0.1, kp_w=5.0, kd_w=1, ki_w=0.05, map_array=self.map_array, origin=self.origin, resolution=self.resolution, influence_distance=0.3)
+                self.follower = WaypointFollower(waypoints=[grid_to_world(i, j, self.origin, self.resolution) for i, j in full_path], waypoint_tolerance= 0.05, max_v=1.4, max_w=3, kp_v=0.8, kd_v=0.1, kp_w=5.0, kd_w=1, ki_w=0.05, map_array=self.map_array, origin=self.origin, resolution=self.resolution, influence_distance=0.3)
                 print("full_path:", full_path)
                 print("full path length:", len(full_path))
 
