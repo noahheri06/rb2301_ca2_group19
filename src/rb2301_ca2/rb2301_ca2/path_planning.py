@@ -296,8 +296,8 @@ class WaypointNode(Node):
 
             if full_path is not None:
                 self.route_planned = True
-                self.path = full_path
-                self.follower = WaypointFollower(waypoints=[grid_to_world(i, j, self.origin, self.resolution) for i, j in full_path], waypoint_tolerance= 0.05, max_v=1.4, max_w=3, kp_v=0.8, kd_v=0.1, kp_w=5.0, kd_w=1, ki_w=0.05, map_array=self.map_array, origin=self.origin, resolution=self.resolution, influence_distance=0.3)
+                self.path = full_path[1:] 
+                self.follower = WaypointFollower(waypoints=[grid_to_world(i, j, self.origin, self.resolution) for i, j in full_path[1:]], waypoint_tolerance= 0.05, max_v=1.4, max_w=2, kp_v=0.8, kd_v=0.1, kp_w=5.0, kd_w=1, ki_w=0.05, map_array=self.map_array, origin=self.origin, resolution=self.resolution, influence_distance=0.3)
                 print("full_path:", full_path)
                 print("full path length:", len(full_path))
 
@@ -307,7 +307,6 @@ class WaypointNode(Node):
                 print(is_finished)
                 self.get_logger().info("All waypoints reached. Stopping robot.")
             self.move_2D(x=v, turn=w)
-            self.prev_pose = self.pose
             
 
     def precompute_astar_moves(
@@ -320,13 +319,13 @@ class WaypointNode(Node):
         include_target: bool = True,
     ) -> Dict[MoveVector, MoveData]:
         """
-        Precomputes all primitive (coprime) move vectors for an n x m grid
+        Precomputes all primitive move vectors for an n x m grid
         up to an optional Euclidean max_radius using a ray sieve and 90-degree
         rotations, along with the relative grid cells that must be free.
 
         Parameters:
-            n: Grid width (number of columns / x-dimension).
-            m: Grid height (number of rows / y-dimension).
+            n: Grid width.
+            m: Grid height.
             max_radius: Maximum Euclidean length of a single move (sqrt(dx^2 + dy^2)).
                         If None, generates moves across the entire n x m grid.
             clearance: Minimum allowed distance from a wall center to the move segment.
